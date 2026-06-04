@@ -1,0 +1,19 @@
+# Datasets (download separately; see README) and experiment outputs
+/data/
+/results/
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.python-version
+
+# uv
+uv.lock
+
+# OS / editor
+.DS_Store
+._*
+*.swp

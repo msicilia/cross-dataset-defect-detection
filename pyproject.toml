@@ -1,0 +1,27 @@
+[project]
+name = "cross-dataset-defect-detection"
+version = "1.0.0"
+description = "Cross-dataset generalisation benchmark for unsupervised defect detection with vision foundation models"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Lino González-García" },
+    { name = "Alberto Ballesteros-Rodríguez" },
+    { name = "Miguel-Ángel Sicilia" },
+    { name = "David Martín-Moncunill" },
+]
+dependencies = [
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "transformers>=4.38.0",
+    "Pillow>=10.0.0",
+    "numpy>=1.26.0",
+    "scikit-learn>=1.4.0",
+    "tqdm>=4.66.0",
+]
+
+# The repository is a collection of scripts, not an installable package;
+# uv manages the environment without building the project itself.
+[tool.uv]
+package = false
