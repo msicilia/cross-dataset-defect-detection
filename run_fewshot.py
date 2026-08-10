@@ -1,10 +1,15 @@
 from __future__ import annotations
-"""Reference-set-size sweep for DINO-PatchCore.
+"""Few-shot training-size ablation for DINO-PatchCore.
 
-Varies the number of normal source images (n_shots = [5, 10, 25, 50, 100, 250,
-500]) and measures cross-dataset AUROC on all targets; seeds [0, 1, 2].
+Sweeps the number of normal training images available from the source domain
+and measures cross-dataset AUROC on all targets. Quantifies how quickly the
+memory bank becomes useful as reference data grows from zero toward the full
+500-image cap.
 
-Results: results/raw/dino_patchcore_fewshot/n<k>/seed<s>/<src>__<tgt>/result.json
+n_shots sweep: [5, 10, 25, 50, 100, 250, 500]
+
+Results saved to:
+    results/raw/dino_patchcore_fewshot/n<k>/seed<s>/<src>__<tgt>/result.json
 """
 import json
 import sys

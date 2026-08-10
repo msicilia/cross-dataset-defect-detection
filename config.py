@@ -72,7 +72,24 @@ CLIP_ZS = {
 # ── Experiment settings ───────────────────────────────────────────────────────
 SEEDS        = [0, 1, 2, 3, 4]
 RESULTS_DIR  = Path("results")
+FIGURES_DIR  = Path("figures")
 
 DATASET_NAMES = ["mvtec", "sdnet", "vision"]
 METHODS       = ["dino_patchcore_small", "dino_patchcore_base",
-                 "dino_patchcore_large", "patchcore", "clip_zs"]
+                 "dino_patchcore_large", "patchcore", "spade", "padim",
+                 "winclip", "winclip_plus", "clip_zs"]
+DINO_VARIANTS = ["small", "base", "large"]
+
+# SPADE: k nearest reference images averaged for the image-level score
+# (k=50 as in the original SPADE paper; capped at the reference set size
+# at run time.)
+SPADE = {"k": 50}
+
+# PaDiM: dimension of the random channel subset per patch position. Must stay
+# well below max_train_images or the per-position covariance is rank-deficient;
+# with a 500-image reference cap, 200 keeps N/d = 2.5.
+PADIM = {"n_dims": 200}
+
+# WinCLIP: each image expands to 1 + 4 + 9 = 14 windows, so the effective CLIP
+# batch is 14x this. Kept small to bound memory on ViT-L/14.
+WINCLIP = {"batch_size": 8}

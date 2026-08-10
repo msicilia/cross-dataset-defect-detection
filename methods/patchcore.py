@@ -1,7 +1,11 @@
 from __future__ import annotations
-"""PatchCore with a WideResNet-50 backbone (supervised ImageNet features).
+"""PatchCore baseline with a WideResNet-50 backbone (supervised ImageNet features).
 
 Identical memory-bank logic to DINOPatchCore; only the feature extractor differs.
+This isolates the contribution of the DINOv2 backbone.
+
+Reference:
+    Roth et al., "Towards Total Recall in Industrial Anomaly Detection", CVPR 2022.
 """
 from pathlib import Path
 
@@ -39,7 +43,7 @@ class PatchCore(AnomalyMethod):
         self.coreset_ratio = coreset_ratio
         self.max_train_images = max_train_images
         self.batch_size = batch_size
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
         backbone = models.wide_resnet50_2(weights=models.Wide_ResNet50_2_Weights.IMAGENET1K_V1)
         backbone.eval().to(self.device)

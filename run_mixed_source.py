@@ -1,9 +1,10 @@
 from __future__ import annotations
 """Mixed-source memory bank experiment.
 
-Builds a DINO-PatchCore memory bank from the combined normal images of two source
-datasets and evaluates on all three target datasets, testing whether pooling
-diverse sources improves cross-dataset generalisation.
+Fits DINO-PatchCore on the combined normal training images from two source
+datasets and evaluates on all three target datasets. Tests the paper's
+recommendation that a mixed bank outperforms any single-domain bank when the
+target domain is heterogeneous.
 
 Source combinations (leave-one-out):
     sdnet + mvtec  → evaluate on vision, sdnet, mvtec

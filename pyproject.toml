@@ -1,6 +1,6 @@
 [project]
 name = "cross-dataset-defect-detection"
-version = "1.0.0"
+version = "1.1.0"
 description = "Cross-dataset generalisation benchmark for unsupervised defect detection with vision foundation models"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,11 +14,17 @@ authors = [
 dependencies = [
     "torch>=2.1.0",
     "torchvision>=0.16.0",
-    "transformers>=4.38.0",
+    # transformers 5.x changed CLIPModel.get_text_features to return
+    # BaseModelOutputWithPooling instead of a tensor, which breaks
+    # methods/clip_zs.py. Reported results were produced on the 4.x line.
+    "transformers>=4.38.0,<5",
     "Pillow>=10.0.0",
     "numpy>=1.26.0",
     "scikit-learn>=1.4.0",
+    "scipy>=1.12.0",
     "tqdm>=4.66.0",
+    "matplotlib>=3.8.0",
+    "seaborn>=0.13.0",
 ]
 
 # The repository is a collection of scripts, not an installable package;

@@ -4,6 +4,11 @@ from __future__ import annotations
 Memory bank is built from patch tokens of defect-free training images.
 Image-level score: max nearest-neighbour distance across all image patches.
 Pixel-level map: per-patch NN distance, upsampled to input resolution.
+
+Reference:
+    Roth et al., "Towards Total Recall in Industrial Anomaly Detection",
+    CVPR 2022 (PatchCore).
+    Oquab et al., "DINOv2", TMLR 2023.
 """
 from pathlib import Path
 
@@ -54,14 +59,22 @@ class DINOPatchCore(AnomalyMethod):
         image_size: int = 256,
         batch_size: int = 16,
         device: str | None = None,
+        # Optional image-space normalisation applied identically to reference
+        # and test images, used by the confounder ablations (run_confounders.py)
+        # to strip one candidate explanation at a time -- colour, illumination,
+        # or resolution -- and see whether the transfer gap survives without it.
+        # None reproduces the standard pipeline exactly.
+        preprocess=None,
+        variant: str = "",
     ):
-        self.name = f"dino_patchcore_{backbone.split('/')[-1]}"
+        self.preprocess = preprocess
+        self.name = f"dino_patchcore_{backbone.split('/')[-1]}" + (f"_{variant}" if variant else "")
         self.backbone_id = backbone
         self.coreset_ratio = coreset_ratio
         self.max_train_images = max_train_images
         self.image_size = image_size
         self.batch_size = batch_size
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
         self.processor = AutoImageProcessor.from_pretrained(backbone)
         self.model = AutoModel.from_pretrained(backbone).to(self.device).eval()
@@ -74,9 +87,12 @@ class DINOPatchCore(AnomalyMethod):
     # ── feature extraction ────────────────────────────────────────────────────
 
     def _load_image(self, path: Path) -> Image.Image:
-        return Image.open(path).convert("RGB").resize(
+        img = Image.open(path).convert("RGB").resize(
             (self.image_size, self.image_size), Image.BILINEAR
         )
+        # Applied after resizing so every variant sees the same geometry, and to
+        # both reference and test images so the two are never mismatched.
+        return self.preprocess(img) if self.preprocess is not None else img
 
     @torch.no_grad()
     def _extract_patches(self, paths: list[Path]) -> np.ndarray:
@@ -101,7 +117,8 @@ class DINOPatchCore(AnomalyMethod):
     def _extract_patch_maps(self, paths: list[Path]) -> list[np.ndarray]:
         """Returns list of (H_p, W_p, D) feature maps, one per image."""
         maps = []
-        for i in range(0, len(paths), self.batch_size):
+        for i in tqdm(range(0, len(paths), self.batch_size),
+                      desc=f"score_maps [{self.name}]", leave=False):
             batch_paths = paths[i : i + self.batch_size]
             images = [self._load_image(p) for p in batch_paths]
             inputs = self.processor(images=images, return_tensors="pt").to(self.device)
@@ -161,7 +178,10 @@ class DINOPatchCore(AnomalyMethod):
 
     def score_maps(self, image_paths: list[Path]) -> list[np.ndarray]:
         assert self.memory_bank is not None, "Call fit() first"
-        patch_maps = self._extract_patch_maps(tqdm(image_paths, desc=f"score_maps [{self.name}]"))
+        # _extract_patch_maps slices its argument and calls len() on it, so it
+        # needs a real sequence rather than an iterator. Progress is reported
+        # inside the extractor.
+        patch_maps = self._extract_patch_maps(list(image_paths))
         result = []
         for fmap in patch_maps:
             H, W, D = fmap.shape

@@ -6,6 +6,11 @@ prompt versus its paired negative prompt.  The final anomaly score is the
 maximum positive probability across all defect categories.
 
 No training data is required; the method is dataset-agnostic.
+
+Reference:
+    Radford et al., "Learning Transferable Visual Models From Natural
+    Language Supervision", ICML 2021.
+    Jeong et al., "WinCLIP", CVPR 2023 (related zero-shot inspection work).
 """
 from pathlib import Path
 
@@ -32,7 +37,7 @@ class CLIPZS(AnomalyMethod):
         self.model_id = model_id
         self.image_size = image_size
         self.batch_size = batch_size
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
         self.processor = CLIPProcessor.from_pretrained(model_id)
         self.model = CLIPModel.from_pretrained(model_id).to(self.device).eval()

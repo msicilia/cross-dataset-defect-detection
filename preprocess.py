@@ -8,8 +8,8 @@ Creates under each dataset root:
 
 Supported datasets (those available or auto-downloadable):
   sdnet      SDNET2018           (already in data/sdnet2018/)
-  mvtec      MVTec AD            (download manually; see README)
-  vision     VISION Workshop     (download manually; see README)
+  mvtec      MVTec AD            (download via setup_data.sh)
+  vision     VISION Workshop     (download via setup_data.sh)
 
 Usage:
   python preprocess.py                          # all available datasets
@@ -180,7 +180,7 @@ def preprocess_mvtec(
 ) -> bool:
     print("\n── MVTec AD ───────────────────────────────────────────")
     if not root.exists():
-        print(f"  SKIP: {root} not found. see the README for download links")
+        print(f"  SKIP: {root} not found. Run: bash setup_data.sh")
         return False
 
     available = sorted(p.name for p in root.iterdir() if p.is_dir())
@@ -271,7 +271,7 @@ def preprocess_vision(
 
     print("\n── VISION Dataset ─────────────────────────────────────")
     if not root.exists():
-        print(f"  SKIP: {root} not found. see the README for download links")
+        print(f"  SKIP: {root} not found. Run: bash setup_data.sh")
         return False
 
     available = sorted(p.name for p in root.iterdir() if p.is_dir())
@@ -328,7 +328,7 @@ def preprocess_vision(
 
     stats = {
         "categories": use_cats,
-        "note": "Metallic subsets only (no concrete categories).",
+        "note": "No concrete categories. Using metallic subsets as corrosion proxy.",
         "train_normal":   len(all_train_records),
         "test_total":     len(all_test_records),
         "test_defective": sum(1 for r in all_test_records if r["label"] == 1),
@@ -382,7 +382,7 @@ def print_summary(results: dict[str, bool]) -> None:
         print(f"\nReady to run experiments on: {', '.join(ready)}")
         print("  python run_experiments.py --datasets " + " ".join(ready))
     else:
-        print("\nNo datasets ready. see the README for download links")
+        print("\nNo datasets ready. Run: bash setup_data.sh")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

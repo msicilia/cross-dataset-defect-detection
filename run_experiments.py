@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import config as cfg
 from datasets import MVTecDataset, SDNETDataset, VISIONDataset
-from methods import DINOPatchCore, PatchCore, CLIPZS
+from methods import DINOPatchCore, PatchCore, SPADE, PaDiM, WinCLIP, CLIPZS
 from evaluate import image_level_metrics, pixel_level_metrics, EvalResult
 
 
@@ -60,6 +60,23 @@ def build_method(name: str, device: str):
                          coreset_ratio=cfg.PATCHCORE["coreset_ratio"],
                          max_train_images=cfg.PATCHCORE["max_train_images"],
                          batch_size=cfg.PATCHCORE["batch_size"])
+    if name == "spade":
+        return SPADE(device=device,
+                     k=cfg.SPADE["k"],
+                     max_train_images=cfg.PATCHCORE["max_train_images"],
+                     batch_size=cfg.PATCHCORE["batch_size"])
+    if name == "padim":
+        return PaDiM(device=device,
+                     n_dims=cfg.PADIM["n_dims"],
+                     max_train_images=cfg.PATCHCORE["max_train_images"],
+                     batch_size=cfg.PATCHCORE["batch_size"])
+    if name in ("winclip", "winclip_plus"):
+        return WinCLIP(model_id=cfg.CLIP_MODEL, device=device,
+                       prompts=cfg.CLIP_ZS["prompts"],
+                       image_size=cfg.CLIP_ZS["image_size"],
+                       few_shot=(name == "winclip_plus"),
+                       max_train_images=cfg.PATCHCORE["max_train_images"],
+                       batch_size=cfg.WINCLIP["batch_size"])
     if name == "clip_zs":
         return CLIPZS(model_id=cfg.CLIP_MODEL, device=device,
                       prompts=cfg.CLIP_ZS["prompts"],
@@ -81,6 +98,30 @@ def save_result(out_dir: Path, result: EvalResult) -> None:
             "threshold":        result.threshold,
             "f1_at_threshold":  result.f1_at_threshold,
         }, f, indent=2)
+
+
+def save_scores(out_dir: Path, scores, labels, paths) -> None:
+    """Persist the per-image scores behind an aggregate metric.
+
+    Storing only summary metrics would mean that any per-category breakdown,
+    bootstrap confidence interval or score-distribution analysis required
+    re-running the model. Keeping the raw vectors makes those pure post-hoc
+    analyses. Paths are stored relative to nothing in particular --
+    they are kept verbatim so that the dataset category can be recovered from
+    the directory structure (e.g. MVTec's <category>/test/<defect>/img.png).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        out_dir / "scores.npz",
+        scores=np.asarray(scores, dtype=np.float64),
+        labels=np.asarray(labels, dtype=np.int8),
+        paths=np.array([str(p) for p in paths]),
+    )
+
+
+def _cell_done(out_dir: Path) -> bool:
+    """A cell counts as complete only with both its metrics and its raw scores."""
+    return (out_dir / "result.json").exists() and (out_dir / "scores.npz").exists()
 
 
 def load_result(out_dir: Path) -> EvalResult | None:
@@ -109,8 +150,12 @@ def run(
         print(f"METHOD: {method_name}")
         print(f"{'='*60}")
 
-        # CLIP-ZS is dataset-agnostic: fit once, evaluate on all targets
-        clip_zs_mode = (method_name == "clip_zs")
+        # Reference-free methods do not depend on the source dataset at all, so
+        # they are fitted once and evaluated on each target. Running them per
+        # (source, seed) like the others would recompute identical numbers 15
+        # times. WinCLIP+ is NOT in this set: its few-shot variant does use
+        # reference images, which is precisely the contrast being tested.
+        clip_zs_mode = method_name in ("clip_zs", "winclip")
 
         method = build_method(method_name, device)
 
@@ -121,6 +166,17 @@ def run(
             if not clip_zs_mode:
                 # Re-instantiate for each seed-average (or once if no seed variation)
                 for seed in seeds:
+                    # Fitting is the expensive half, so skip it outright when
+                    # every target for this (source, seed) is already stored --
+                    # otherwise a resumed run rebuilds banks it never uses.
+                    if skip_existing and all(
+                        _cell_done(results_root / method_name / f"seed{seed}"
+                                   / f"{src_name}__{t}")
+                        for t in datasets
+                    ):
+                        print(f"\n  [{src_name} (seed={seed})] all targets done, "
+                              f"skipping fit")
+                        continue
                     src_ds = build_dataset(src_name, seed)
                     method = build_method(method_name, device)
                     train_split = src_ds.normal_train()
@@ -151,7 +207,9 @@ def _evaluate_all_targets(
 ) -> None:
     for tgt_name in datasets:
         out_dir = results_root / method_name / f"seed{seed}" / f"{src_name}__{tgt_name}"
-        if skip_existing and load_result(out_dir) is not None:
+        # A cell counts as done only if the per-image scores are present too,
+        # not just the summary metrics.
+        if skip_existing and _cell_done(out_dir):
             print(f"    [{src_name} → {tgt_name}] already done, skipping")
             continue
 
@@ -173,6 +231,7 @@ def _evaluate_all_targets(
                 pass
 
         save_result(out_dir, result)
+        save_scores(out_dir, scores, labels, test.image_paths)
         print(f"AUROC={result.image_auroc:.4f}  AP={result.image_ap:.4f}")
 
 
@@ -184,7 +243,7 @@ def parse_args():
                    default=["dino_patchcore_base", "patchcore", "clip_zs"])
     p.add_argument("--datasets", nargs="+", default=cfg.DATASET_NAMES)
     p.add_argument("--seeds",    nargs="+", type=int, default=[0])
-    p.add_argument("--device",   default="cuda" if __import__("torch").cuda.is_available() else "cpu")
+    p.add_argument("--device",   default="cuda" if __import__("torch").cuda.is_available() else "mps" if __import__("torch").backends.mps.is_available() else "cpu")
     p.add_argument("--skip-existing", action="store_true")
     p.add_argument("--no-pixel",      action="store_true")
     return p.parse_args()

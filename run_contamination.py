@@ -1,13 +1,36 @@
 from __future__ import annotations
-"""Count-matched contamination experiment.
+"""Controlled memory-bank contamination experiment.
 
-For each base source B and seed, builds three memory banks: 250 of B, 500 of B,
-and 250 of B + 250 of each other source X (the 250-image B core is shared across
-banks). Every bank is scored on all three targets. Targets larger than
---max-test are stratified-subsampled (label-balanced) per seed.
+Disentangles "does dataset X contaminate the memory bank?" from "did we just give
+the bank fewer good images?" by holding the good-source count fixed and varying
+ONLY what is added.
+
+For every base source B in {sdnet, mvtec, vision}, and every seed, we build:
+
+    {B}250         : 250 images of B                       (baseline)
+    {B}500         : 500 images of B                       (placebo: +250 MORE of the same)
+    {B}250+{X}250  : the same 250 of B, plus 250 of X      (one per other source X)
+
+The 250-image core of B is identical across all conditions for a given seed
+(it is the first 250 of the sampled-500 pool), so {B}500 and {B}250+{X}250 differ
+from {B}250 by exactly +250 images -- the only variable is WHAT those 250 are.
+
+Every bank is evaluated on ALL three targets T (the "exam"), so each role is
+rotated: each dataset serves as base, as added source, and as target. The clean
+contamination quantity is
+
+    Delta(B, X -> T) = AUROC({B}250+{X}250 -> T) - AUROC({B}250 -> T)
+
+with {B}500 -> T as the count-matched control (adding GOOD data should not hurt).
+
+Targets larger than --max-test are stratified-subsampled (label-balanced) per
+seed to bound runtime; this affects absolute AUROC slightly but not the
+count-controlled differences the experiment is about.
 
 Results: results/raw/dino_patchcore_contamination/<config>/seed<s>/<tgt>/result.json
-Usage:   python run_contamination.py [--seeds 0 1 2 3 4] [--max-test 2000]
+
+Usage:
+    python run_contamination.py [--seeds 0 1 2 3 4] [--max-test 2000]
 """
 import argparse
 import json
@@ -104,7 +127,7 @@ def run(seeds: list[int], max_test: int | None) -> None:
             base250 = poolB[:N_BASE]
             configs[f"{B}{N_BASE}"]            = base250            # baseline
             if len(poolB) >= N_BASE + N_ADD:
-                configs[f"{B}{N_BASE+N_ADD}"]  = poolB[:N_BASE + N_ADD]  # 250 base + 250 more of same source
+                configs[f"{B}{N_BASE+N_ADD}"]  = poolB[:N_BASE + N_ADD]  # placebo: +250 same
             for X in DATASETS:
                 if X == B:
                     continue

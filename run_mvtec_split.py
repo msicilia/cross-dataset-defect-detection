@@ -1,18 +1,27 @@
 from __future__ import annotations
-"""Cross-group transfer with MVTec split into textures and metallic objects.
+"""Cross-group transfer with MVTec split into textures vs metallic objects.
+
+Motivation: the five MVTec categories we use are not homogeneous --- tile, wood
+and grid are flat-surface *textures* (akin to concrete cracks), whereas metal_nut
+and screw are metallic *objects* (akin to VISION components). Feature-space
+distances show SDNET is closest to MVTec-textures and MVTec-objects closest to
+VISION, with the two MVTec halves being the most distant pair of all. This script
+confirms that structure at the *transfer* (AUROC) level.
 
 Groups (each acts as source and as target):
-    sdnet       SDNET2018
-    mvtec_tex   MVTec tile + wood + grid
-    mvtec_obj   MVTec metal_nut + screw
-    vision      VISION Casting/Ring/Screw/Cylinder
+    sdnet       SDNET2018 (concrete)
+    mvtec_tex   MVTec tile + wood + grid     (flat-surface textures)
+    mvtec_obj   MVTec metal_nut + screw      (metallic objects)
+    vision      VISION Casting/Ring/Screw/Cylinder (metallic objects)
 
 For each (source, target) and seed, DINO-PatchCore builds a memory bank from the
 source's defect-free images (<=500) and is scored on the target test split.
 Targets larger than --max-test are stratified-subsampled per seed.
 
 Results: results/raw/dino_patchcore_mvtecsplit/<src>__<tgt>/seed<s>/result.json
-Usage:   python run_mvtec_split.py [--seeds 0 1 2 3 4] [--max-test 2000]
+
+Usage:
+    python run_mvtec_split.py [--seeds 0 1 2 3 4] [--max-test 2000]
 """
 import argparse
 import json

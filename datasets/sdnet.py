@@ -9,6 +9,10 @@ Expected directory layout (original SDNET2018 structure):
       D/CD/  D/UD/    ← Bridge Decks (cracked / uncracked)
       P/CP/  P/UP/    ← Pavements
       W/CW/  W/UW/    ← Walls  ← default subset
+
+Reference:
+    Dorafshan et al., SDNET2018, Utah State University, 2018.
+    https://digitalcommons.usu.edu/all_datasets/48/
 """
 import json
 import random

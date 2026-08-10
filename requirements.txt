@@ -1,0 +1,13 @@
+torch>=2.1.0
+torchvision>=0.16.0
+# Upper bound required: transformers 5.x changed CLIPModel.get_text_features to
+# return BaseModelOutputWithPooling instead of a tensor, which breaks
+# methods/clip_zs.py. Reported results were produced on the 4.x line.
+transformers>=4.38.0,<5
+Pillow>=10.0.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+scipy>=1.12.0
+tqdm>=4.66.0
+matplotlib>=3.8.0
+seaborn>=0.13.0

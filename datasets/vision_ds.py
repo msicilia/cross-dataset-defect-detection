@@ -21,8 +21,12 @@ Normal training split: 80% of inference/ images (per-category, seeded).
 Test split: 20% of inference/ (label=0) + all train/ + val/ (label=1).
 No pixel-level masks; evaluation is image-level only.
 
-Categories used (metallic):
+Categories used (metallic, as corrosion proxy):
     Casting, Ring, Screw, Cylinder
+
+Reference:
+    Bai et al., "VISION Datasets", arXiv:2306.07890, 2023.
+    https://huggingface.co/datasets/VISION-Workshop/VISION-Datasets
 """
 import json
 from pathlib import Path
