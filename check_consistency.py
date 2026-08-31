@@ -1,13 +1,14 @@
 from __future__ import annotations
 """Consistency audit over every result in the tree.
 
-Run before deriving any reported number. Four independent checks:
+Run before touching the manuscript. Four independent checks:
 
   1. INTEGRITY   every scores.npz reproduces the result.json beside it
   2. COMPLETENESS every experiment set has the cell count it should
   3. SANITY      no AUROC outside [0,1], no NaN, no empty score vector
   4. PROVENANCE  no result file predates the code that produced it, which is
-                 how a silently inconsistent set would look
+                 how a silently inconsistent set would look (the SPADE layer
+                 change came within two minutes of causing exactly that)
 
 Usage:  python check_consistency.py
 """
@@ -78,9 +79,19 @@ def main() -> None:
     print("3. SANITY — value ranges")
     bad = 0
     for rj in ROOT.rglob("result.json"):
-        v = json.load(open(rj)).get("image_auroc")
-        if v is None or not (0.0 <= v <= 1.0) or v != v:
-            fails.append(f"implausible AUROC in {rj}: {v}"); bad += 1
+        d = json.load(open(rj))
+        # Not every experiment reports image_auroc: the localisation runs are
+        # pixel-level only. Validate whatever bounded metrics a file does carry,
+        # and require at least one of them.
+        bounded = {k: v for k, v in d.items()
+                   if ("auroc" in k or k.endswith("_ap") or k == "argmax_in_mask")
+                   and isinstance(v, (int, float))}
+        if not bounded:
+            fails.append(f"no bounded metric in {rj}"); bad += 1
+            continue
+        for k, v in bounded.items():
+            if v != v or not (0.0 <= v <= 1.0):
+                fails.append(f"implausible {k} in {rj}: {v}"); bad += 1
     print(f"   {bad} implausible values")
 
     print("4. PROVENANCE — results must postdate the code that made them")
