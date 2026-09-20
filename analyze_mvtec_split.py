@@ -1,161 +1,193 @@
-from __future__ import annotations
-"""Texture-vs-object structure: analysis for the MVTec-split study.
+"""Feature distance and transfer between four groups with MVTec AD split.
 
-Produces a two-panel figure over four groups
-    SDNET | MVTec-tex (tile,wood,grid) | MVTec-obj (metal_nut,screw) | VISION
-  (a) mean pairwise cosine distance in DINOv2 feature space (5 samples)
-  (b) cross-group transfer AUROC for DINO-PatchCore (from run_mvtec_split.py)
+Groups (keys as in run_mvtec_split.py): sdnet (SDNET2018), mvtec_tex (MVTec tile,
+wood, grid), mvtec_obj (MVTec metal_nut, screw) and vision (VISION). The key
+mvtec_obj names result directories and is kept; it is labelled MVTec-metal, as
+in the paper. Clusters: surface = {sdnet, mvtec_tex}, metallic = {mvtec_obj,
+vision}.
 
-Both should reveal two super-clusters: flat surfaces {SDNET, MVTec-tex} and
-metallic objects {MVTec-obj, VISION}.
+Feature distance: the protocol of analyze_divergence.py, with its helpers and
+defaults: n images per group per draw (default N_PER_GROUP) from the
+normal_train() split of each group as built by run_mvtec_split.py, DRAWS draws,
+the same per-group sampling tag, and per pair and draw the same measures,
+including the RBF bandwidth from the median heuristic on that pair's pooled
+sample. Every group pool must hold at least n images.
 
-Output:
-    results/figures/mvtec_split.pdf / .png
-    results/mvtec_split.json
+Transfer: DINO-PatchCore image AUROC from run_mvtec_split.py,
+results/raw/dino_patchcore_mvtecsplit/<source>__<target>/seed<s>/result.json,
+mean and SD (ddof=1) over cfg.SEEDS. Within-surface, within-metallic and
+cross-cluster transfer are the means of the seed-mean off-diagonal cells whose
+source and target lie in the same surface cluster, the same metallic cluster,
+or different clusters.
 
-Usage:
-    python analyze_mvtec_split.py [--n 90] [--seeds 0 1 2 3 4]
+Figure: (a) mean pairwise cosine distance, (b) transfer AUROC; the colour
+range of (b) is symmetric about chance (0.5) and spans the data.
+
+Usage:  python analyze_mvtec_split.py [--n 200] [--draws 5] [--out results] [--device cpu]
+Output: <out>/mvtec_split.json, <out>/figures/mvtec_split.{pdf,png}
 """
+from __future__ import annotations
+
 import argparse
 import json
-import random
-from itertools import combinations
 from pathlib import Path
 
 import numpy as np
-import torch
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from PIL import Image
-from transformers import AutoImageProcessor, AutoModel
 
 import config as cfg
+from analyze_divergence import (DRAWS, MEASURES, MODEL, N_PER_GROUP, pairwise_measures,
+                                sample_embeddings, summarise, write_json)
+from common import pick_device
+from run_mvtec_split import GROUPS, MVTEC_GROUPS, build_group
 
-GROUPS = ["sdnet", "mvtec_tex", "mvtec_obj", "vision"]
-LABEL  = {"sdnet": "SDNET", "mvtec_tex": "MVTec-tex", "mvtec_obj": "MVTec-metal", "vision": "VISION"}
-MVTEC_TEX = ["tile", "wood", "grid"]
-MVTEC_OBJ = ["metal_nut", "screw"]
-FIG = cfg.RESULTS_DIR / "figures"
+LABEL = {"sdnet": "SDNET", "mvtec_tex": "MVTec-tex", "mvtec_obj": "MVTec-metal",
+         "vision": "VISION"}
+CLUSTERS = {"surface": ["sdnet", "mvtec_tex"], "metallic": ["mvtec_obj", "vision"]}
 RAW = cfg.RESULTS_DIR / "raw" / "dino_patchcore_mvtecsplit"
 
 
-def _imgs(d, p): return [x for x in sorted(Path(d).glob(p)) if not x.name.startswith("._")]
+def group_pools() -> dict[str, list[Path]]:
+    return {g: list(build_group(g).normal_train().image_paths) for g in GROUPS}
 
 
-def pool(g):
-    data = cfg.DATA_ROOT
-    if g == "sdnet":
-        return _imgs(data / "sdnet2018" / "W" / "UW", "*.jpg")
-    if g == "vision":
-        ps = []
-        for c in cfg.VISION_CATEGORIES:
-            ps += _imgs(data / "vision_dataset" / c / "inference", "*.jpg")
-        return ps
-    cats = MVTEC_TEX if g == "mvtec_tex" else MVTEC_OBJ
-    ps = []
-    for c in cats:
-        ps += _imgs(data / "mvtec_anomaly_detection" / c / "train" / "good", "*.png")
-    return ps
+def transfer() -> dict:
+    expected = {(s, t, seed): RAW / f"{s}__{t}" / f"seed{seed}" / "result.json"
+                for s in GROUPS for t in GROUPS for seed in cfg.SEEDS}
+    missing = [str(p) for p in expected.values() if not p.exists()]
+    if missing:
+        raise SystemExit("missing MVTec-split runs:\n  " + "\n  ".join(missing))
+    per_seed = np.array([[[json.loads(expected[(s, t, seed)].read_text())["image_auroc"]
+                           for seed in cfg.SEEDS] for t in GROUPS] for s in GROUPS])
+    mean = per_seed.mean(axis=2)
+    sd = per_seed.std(axis=2, ddof=1)
 
-
-@torch.no_grad()
-def embed(paths, proc, model, device):
-    out = []
-    for i in range(0, len(paths), 16):
-        ims = [Image.open(p).convert("RGB").resize((256, 256)) for p in paths[i:i + 16]]
-        out.append(model(**proc(images=ims, return_tensors="pt").to(device))
-                   .last_hidden_state[:, 0, :].cpu().numpy())
-    return np.concatenate(out)
-
-
-def feature_matrix(n, seeds):
-    device = ("mps" if torch.backends.mps.is_available()
-              else "cuda" if torch.cuda.is_available() else "cpu")
-    proc = AutoImageProcessor.from_pretrained(cfg.DINOV2_MODELS["base"])
-    model = AutoModel.from_pretrained(cfg.DINOV2_MODELS["base"]).to(device).eval()
-    POOL = {g: pool(g) for g in GROUPS}
-    dist = {p: [] for p in combinations(GROUPS, 2)}
-    for s in seeds:
-        rng = random.Random(s); U = {}
-        for g in GROUPS:
-            ps = POOL[g][:]; rng.shuffle(ps)
-            e = embed(ps[:n], proc, model, device)
-            U[g] = e / np.linalg.norm(e, axis=1, keepdims=True)
-        for a, b in combinations(GROUPS, 2):
-            dist[(a, b)].append(float((1 - U[a] @ U[b].T).mean()))
-    M = np.full((4, 4), np.nan)
-    for a, b in combinations(GROUPS, 2):
-        i, j = GROUPS.index(a), GROUPS.index(b)
-        M[i, j] = M[j, i] = np.mean(dist[(a, b)])
-    return M
-
-
-def transfer_matrix():
-    M = np.full((4, 4), np.nan)
+    cluster_of = {g: c for c, gs in CLUSTERS.items() for g in gs}
+    buckets = {"within_surface": [], "within_metallic": [], "cross_cluster": []}
     for i, s in enumerate(GROUPS):
         for j, t in enumerate(GROUPS):
-            vals = [json.load(open(f))["image_auroc"]
-                    for f in sorted(RAW.glob(f"{s}__{t}/seed*/result.json"))]
-            if vals:
-                M[i, j] = np.mean(vals)
-    return M
-
-
-def _heat(ax, M, title, cmap, vlo, vhi, fmt, mask_diag=False, lo_text_thresh=None):
-    A = M.copy()
-    if mask_diag:
-        np.fill_diagonal(A, np.nan)
-    masked = np.ma.masked_invalid(A)
-    cm = matplotlib.colormaps[cmap].copy(); cm.set_bad("#dddddd")
-    im = ax.imshow(masked, cmap=cm, vmin=vlo, vmax=vhi)
-    ax.set_xticks(range(4)); ax.set_xticklabels([LABEL[g] for g in GROUPS], fontsize=8, rotation=30, ha="right")
-    ax.set_yticks(range(4)); ax.set_yticklabels([LABEL[g] for g in GROUPS], fontsize=8)
-    for i in range(4):
-        for j in range(4):
-            if np.isnan(A[i, j]):
-                ax.text(j, i, "--", ha="center", va="center", color="#888", fontsize=9)
+            if i == j:
+                continue
+            if cluster_of[s] != cluster_of[t]:
+                key = "cross_cluster"
             else:
-                c = "white" if (lo_text_thresh is not None and A[i, j] < lo_text_thresh) else "black"
-                ax.text(j, i, fmt.format(A[i, j]), ha="center", va="center", color=c, fontsize=9)
+                key = f"within_{cluster_of[s]}"
+            buckets[key].append((s, t))
+    averages = {k: {"mean": float(np.mean([mean[GROUPS.index(s), GROUPS.index(t)]
+                                           for s, t in cells])),
+                    "cells": [f"{s}__{t}" for s, t in cells]}
+                for k, cells in buckets.items()}
+    return {"per_seed": per_seed, "mean": mean, "sd": sd, "averages": averages}
+
+
+def heatmap(ax, M, title, cmap_name, vmin, vmax, fmt):
+    import matplotlib
+
+    A = np.ma.masked_invalid(M)
+    cmap = matplotlib.colormaps[cmap_name].copy()
+    cmap.set_bad("#dddddd")
+    norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
+    im = ax.imshow(A, cmap=cmap, norm=norm)
+    ticks = [LABEL[g] for g in GROUPS]
+    ax.set_xticks(range(len(GROUPS)), ticks, fontsize=8, rotation=30, ha="right")
+    ax.set_yticks(range(len(GROUPS)), ticks, fontsize=8)
+    for i in range(len(GROUPS)):
+        for j in range(len(GROUPS)):
+            if np.isnan(M[i, j]):
+                ax.text(j, i, "--", ha="center", va="center", color="#555555", fontsize=9)
+                continue
+            r, g, b, _ = cmap(norm(M[i, j]))
+            luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            ax.text(j, i, fmt.format(M[i, j]), ha="center", va="center", fontsize=9,
+                    color="black" if luminance > 0.5 else "white")
     ax.set_title(title, fontsize=10)
     return im
 
 
-def main(n, seeds):
-    Mf = feature_matrix(n, seeds)
-    Mt = transfer_matrix()
+def figure(distance: np.ndarray, transfer_mean: np.ndarray, out_dir: Path, draws: int) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    # TrueType, not matplotlib's default Type 3: Type 3 renders poorly at
+    # the sizes these figures are printed at, and IEEE rejects Type 3.
+    matplotlib.rcParams["pdf.fonttype"] = 42
+    import matplotlib.pyplot as plt
 
-    print("Feature mean-pairwise distance:");  print(np.round(Mf, 3))
-    print("Transfer AUROC (rows=source, cols=target):"); print(np.round(Mt, 3))
-    json.dump({"groups": GROUPS,
-               "feature_distance": Mf.tolist(),
-               "transfer_auroc": Mt.tolist()},
-              open(cfg.RESULTS_DIR / "mvtec_split.json", "w"), indent=2)
-
-    have_t = not np.all(np.isnan(Mt))
-    ncol = 2 if have_t else 1
-    fig, axes = plt.subplots(1, ncol, figsize=(4.7 * ncol, 3.8))
-    axes = np.atleast_1d(axes)
-    off = Mf[~np.isnan(Mf)]
-    im0 = _heat(axes[0], Mf, "(a) Feature distance", "viridis",
-                off.min() - 0.005, off.max() + 0.005, "{:.3f}",
-                mask_diag=True, lo_text_thresh=(off.min() + off.max()) / 2)
+    fig, axes = plt.subplots(1, 2, figsize=(9.4, 3.8))
+    off = distance[~np.isnan(distance)]
+    im0 = heatmap(axes[0], distance, f"(a) Mean pairwise cosine distance ({draws} draws)",
+                  "viridis", off.min(), off.max(), "{:.3f}")
     fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-    if have_t:
-        im1 = _heat(axes[1], Mt, "(b) Transfer AUROC", "RdYlGn", 0.40, 0.95, "{:.2f}",
-                    lo_text_thresh=0.62)
-        fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+    half = float(np.abs(transfer_mean - 0.5).max())
+    im1 = heatmap(axes[1], transfer_mean,
+                  f"(b) Transfer AUROC (mean over {len(cfg.SEEDS)} seeds)",
+                  "RdYlGn", 0.5 - half, 0.5 + half, "{:.2f}")
+    fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
     fig.tight_layout()
-    FIG.mkdir(parents=True, exist_ok=True)
-    fig.savefig(FIG / "mvtec_split.pdf", bbox_inches="tight")
-    fig.savefig(FIG / "mvtec_split.png", dpi=140, bbox_inches="tight")
-    print(f"-> wrote {FIG/'mvtec_split.pdf'} (transfer panel: {'yes' if have_t else 'pending'})")
+    figs = out_dir / "figures"
+    figs.mkdir(parents=True, exist_ok=True)
+    for ext in ("pdf", "png"):
+        fig.savefig(figs / f"mvtec_split.{ext}", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  figure written to {figs / 'mvtec_split.pdf'}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n", type=int, default=N_PER_GROUP, help="images per group per draw")
+    ap.add_argument("--draws", type=int, default=DRAWS)
+    ap.add_argument("--out", type=Path, default=cfg.RESULTS_DIR)
+    ap.add_argument("--device", default=None)
+    args = ap.parse_args()
+
+    tr = transfer()
+    device = pick_device(args.device)
+    pools = group_pools()
+    print("  pool sizes: " + ", ".join(f"{g} {len(p)}" for g, p in pools.items()))
+    _, emb = sample_embeddings(pools, args.n, args.draws, device)
+    per_pair, gammas, rel_imag = pairwise_measures(emb, args.draws)
+    pairs = {p: {k: summarise(v[k]) for k in MEASURES} for p, v in per_pair.items()}
+
+    k = len(GROUPS)
+    distance = {m: np.full((k, k), np.nan) for m in MEASURES}
+    for i, a in enumerate(GROUPS):
+        for j, b in enumerate(GROUPS):
+            if i < j:
+                for m in MEASURES:
+                    distance[m][i, j] = distance[m][j, i] = pairs[f"{a}__{b}"][m]["mean"]
+
+    np.set_printoptions(precision=3, suppress=True)
+    print(f"\n  groups: {GROUPS}")
+    print(f"  mean pairwise cosine distance (n={args.n}, {args.draws} draws):")
+    print(distance["cosine"])
+    print("  transfer AUROC mean (rows source, columns target):")
+    print(tr["mean"])
+    print("  transfer AUROC SD (ddof=1):")
+    print(tr["sd"])
+    for name, v in tr["averages"].items():
+        print(f"  {name:16s} {v['mean']:.3f}  over {v['cells']}")
+
+    figure(distance["cosine"], tr["mean"], args.out, args.draws)
+
+    def nan_to_none(M):
+        return [[None if np.isnan(x) else float(x) for x in row] for row in M]
+
+    write_json(args.out / "mvtec_split.json", {
+        "config": {"model": MODEL, "n_per_group": args.n, "draws": list(range(args.draws)),
+                   "seeds": list(cfg.SEEDS), "groups": GROUPS, "labels": LABEL,
+                   "mvtec_groups": MVTEC_GROUPS, "clusters": CLUSTERS, "device": device},
+        "groups": GROUPS,
+        "pool_sizes": {g: len(p) for g, p in pools.items()},
+        "feature_distance": nan_to_none(distance["cosine"]),
+        "feature_pairs": pairs,
+        "rbf_gamma_per_pair_per_draw": gammas,
+        "frechet_max_rel_imag_per_draw": rel_imag,
+        "transfer_auroc": tr["mean"].tolist(),
+        "transfer_auroc_sd": tr["sd"].tolist(),
+        "transfer_auroc_per_seed": {f"{s}__{t}": tr["per_seed"][i, j].tolist()
+                                    for i, s in enumerate(GROUPS) for j, t in enumerate(GROUPS)},
+        "transfer_averages": tr["averages"],
+    })
+    print(f"  written to {args.out / 'mvtec_split.json'}")
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=90)
-    ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
-    a = ap.parse_args()
-    main(a.n, a.seeds)
+    main()

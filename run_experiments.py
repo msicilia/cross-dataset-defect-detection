@@ -1,261 +1,189 @@
-from __future__ import annotations
-"""Main experiment runner: cross-dataset generalisation benchmark.
+"""Cross-dataset benchmark.
 
-For each (method, source_dataset, target_dataset) triple, fits the method on
-the source normal training split and evaluates on the target test split.
-Results are saved incrementally to results/raw/<method>/<src>__<tgt>.json
-so that a crash does not lose progress.
+Each reference-based detector builds its model from the defect-free reference
+images of a source dataset (at most PATCHCORE["max_train_images"], drawn with
+the run seed) and scores the full test split of every target dataset.
+Reference-free detectors (CLIP-ZS, WinCLIP) are evaluated once per target and
+stored with source "none" and seed 0.
+
+Results: results/raw/<method>/seed<s>/<source>__<target>/{result.json,scores.npz}
+
+Complete cells produced with the same configuration are skipped, and a model
+is built only if at least one of its cells is missing. A complete cell with a
+different configuration stops the run (see common.cell_done).
 
 Usage:
-    python run_experiments.py [--methods M [M ...]] [--datasets D [D ...]]
-                              [--seeds S [S ...]] [--device cuda|cpu]
-                              [--skip-existing]
+    python run_experiments.py [--methods M ...] [--datasets D ...]
+                              [--seeds S ...] [--device cuda|mps|cpu]
 """
+from __future__ import annotations
+
 import argparse
+import hashlib
+import inspect
 import json
-import sys
-from pathlib import Path
 
 import numpy as np
 
-# ── project imports ───────────────────────────────────────────────────────────
-sys.path.insert(0, str(Path(__file__).parent))
-
 import config as cfg
-from datasets import MVTecDataset, SDNETDataset, VISIONDataset
-from methods import DINOPatchCore, PatchCore, SPADE, PaDiM, WinCLIP, CLIPZS
-from evaluate import image_level_metrics, pixel_level_metrics, EvalResult
+from common import build_dataset, cell_done, pick_device, save_cell
+from evaluate import image_level_metrics
+from methods import CLIPZS, DINOPatchCore, PaDiM, PatchCore, SPADE, WinCLIP
 
+METHODS = [
+    "dino_patchcore_small", "dino_patchcore_base", "dino_patchcore_large",
+    "patchcore", "spade", "padim", "winclip", "winclip_plus", "clip_zs",
+]
+PAPER_METHODS = [
+    "dino_patchcore_base", "patchcore", "spade", "padim",
+    "winclip", "winclip_plus", "clip_zs",
+]
+REFERENCE_FREE = {"clip_zs", "winclip"}
 
-# ── dataset factory ───────────────────────────────────────────────────────────
-
-def build_dataset(name: str, seed: int = 0):
-    root = cfg.DATASET_PATHS[name]
-    if name == "mvtec":
-        return MVTecDataset(root, categories=cfg.MVTEC_CATEGORIES)
-    if name == "sdnet":
-        return SDNETDataset(root, seed=seed)  # all subsets (W/D/P) when manifest present
-    if name == "vision":
-        return VISIONDataset(root, categories=cfg.VISION_CATEGORIES)
-    raise ValueError(f"Unknown dataset: {name}")
-
-
-# ── method factory ────────────────────────────────────────────────────────────
 
 def build_method(name: str, device: str):
-    if name == "dino_patchcore_small":
-        return DINOPatchCore(backbone=cfg.DINOV2_MODELS["small"], device=device,
-                             **{k: v for k, v in cfg.PATCHCORE.items()
-                                if k != "image_size"}, image_size=cfg.PATCHCORE["image_size"])
-    if name == "dino_patchcore_base":
-        return DINOPatchCore(backbone=cfg.DINOV2_MODELS["base"], device=device,
-                             **{k: v for k, v in cfg.PATCHCORE.items()
-                                if k != "image_size"}, image_size=cfg.PATCHCORE["image_size"])
-    if name == "dino_patchcore_large":
-        return DINOPatchCore(backbone=cfg.DINOV2_MODELS["large"], device=device,
-                             **{k: v for k, v in cfg.PATCHCORE.items()
-                                if k != "image_size"}, image_size=cfg.PATCHCORE["image_size"])
+    pc = cfg.PATCHCORE
+    if name.startswith("dino_patchcore_"):
+        size = name.removeprefix("dino_patchcore_")
+        return DINOPatchCore(backbone=cfg.DINOV2_MODELS[size], device=device,
+                             coreset_ratio=pc["coreset_ratio"],
+                             max_train_images=pc["max_train_images"],
+                             image_size=pc["image_size"],
+                             batch_size=pc["batch_size"])
     if name == "patchcore":
-        return PatchCore(device=device,
-                         coreset_ratio=cfg.PATCHCORE["coreset_ratio"],
-                         max_train_images=cfg.PATCHCORE["max_train_images"],
-                         batch_size=cfg.PATCHCORE["batch_size"])
+        return PatchCore(device=device, coreset_ratio=pc["coreset_ratio"],
+                         max_train_images=pc["max_train_images"],
+                         batch_size=pc["batch_size"])
     if name == "spade":
-        return SPADE(device=device,
-                     k=cfg.SPADE["k"],
-                     max_train_images=cfg.PATCHCORE["max_train_images"],
-                     batch_size=cfg.PATCHCORE["batch_size"])
+        return SPADE(device=device, k=cfg.SPADE["k"],
+                     max_train_images=pc["max_train_images"],
+                     batch_size=pc["batch_size"])
     if name == "padim":
-        return PaDiM(device=device,
-                     n_dims=cfg.PADIM["n_dims"],
-                     max_train_images=cfg.PATCHCORE["max_train_images"],
-                     batch_size=cfg.PATCHCORE["batch_size"])
+        return PaDiM(device=device, n_dims=cfg.PADIM["n_dims"], eps=cfg.PADIM["eps"],
+                     max_train_images=pc["max_train_images"],
+                     batch_size=pc["batch_size"])
     if name in ("winclip", "winclip_plus"):
         return WinCLIP(model_id=cfg.CLIP_MODEL, device=device,
                        prompts=cfg.CLIP_ZS["prompts"],
                        image_size=cfg.CLIP_ZS["image_size"],
                        few_shot=(name == "winclip_plus"),
-                       max_train_images=cfg.PATCHCORE["max_train_images"],
+                       max_train_images=pc["max_train_images"],
                        batch_size=cfg.WINCLIP["batch_size"])
     if name == "clip_zs":
         return CLIPZS(model_id=cfg.CLIP_MODEL, device=device,
                       prompts=cfg.CLIP_ZS["prompts"],
                       image_size=cfg.CLIP_ZS["image_size"],
                       batch_size=cfg.CLIP_ZS["batch_size"])
-    raise ValueError(f"Unknown method: {name}")
+    raise ValueError(f"unknown method: {name}")
 
 
-# ── result serialisation ──────────────────────────────────────────────────────
-
-def save_result(out_dir: Path, result: EvalResult) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "result.json", "w") as f:
-        json.dump({
-            "image_auroc":      result.image_auroc,
-            "image_ap":         result.image_ap,
-            "pixel_auroc":      result.pixel_auroc,
-            "pixel_ap":         result.pixel_ap,
-            "threshold":        result.threshold,
-            "f1_at_threshold":  result.f1_at_threshold,
-        }, f, indent=2)
+def prompts_digest() -> str:
+    """Digest of the CLIP prompt pairs, so that editing them invalidates stored cells."""
+    text = json.dumps(cfg.CLIP_ZS["prompts"], sort_keys=True)
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def save_scores(out_dir: Path, scores, labels, paths) -> None:
-    """Persist the per-image scores behind an aggregate metric.
-
-    Storing only summary metrics would mean that any per-category breakdown,
-    bootstrap confidence interval or score-distribution analysis required
-    re-running the model. Keeping the raw vectors makes those pure post-hoc
-    analyses. Paths are stored relative to nothing in particular --
-    they are kept verbatim so that the dataset category can be recovered from
-    the directory structure (e.g. MVTec's <category>/test/<defect>/img.png).
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out_dir / "scores.npz",
-        scores=np.asarray(scores, dtype=np.float64),
-        labels=np.asarray(labels, dtype=np.int8),
-        paths=np.array([str(p) for p in paths]),
-    )
+def _default(cls, arg: str):
+    """Default of a constructor argument that build_method does not set."""
+    return list(inspect.signature(cls.__init__).parameters[arg].default)
 
 
-def _cell_done(out_dir: Path) -> bool:
-    """A cell counts as complete only with both its metrics and its raw scores."""
-    return (out_dir / "result.json").exists() and (out_dir / "scores.npz").exists()
+def method_params(name: str) -> dict:
+    """The build_method settings that affect scores."""
+    pc = cfg.PATCHCORE
+    if name.startswith("dino_patchcore_"):
+        return {"backbone": cfg.DINOV2_MODELS[name.removeprefix("dino_patchcore_")],
+                "max_reference_images": pc["max_train_images"],
+                "coreset_ratio": pc["coreset_ratio"],
+                "image_size": pc["image_size"]}
+    if name == "patchcore":
+        return {"layers": _default(PatchCore, "layers"),
+                "max_reference_images": pc["max_train_images"],
+                "coreset_ratio": pc["coreset_ratio"]}
+    if name == "spade":
+        return {"layers": _default(SPADE, "layers"),
+                "max_reference_images": pc["max_train_images"], "k": cfg.SPADE["k"]}
+    if name == "padim":
+        return {"layers": _default(PaDiM, "layers"),
+                "max_reference_images": pc["max_train_images"],
+                "n_dims": cfg.PADIM["n_dims"], "eps": cfg.PADIM["eps"]}
+    if name == "winclip_plus":
+        return {"model": cfg.CLIP_MODEL, "max_reference_images": pc["max_train_images"],
+                "image_size": cfg.CLIP_ZS["image_size"], "prompts": prompts_digest()}
+    if name in ("winclip", "clip_zs"):
+        return {"model": cfg.CLIP_MODEL, "image_size": cfg.CLIP_ZS["image_size"],
+                "prompts": prompts_digest()}
+    raise ValueError(f"unknown method: {name}")
 
 
-def load_result(out_dir: Path) -> EvalResult | None:
-    p = out_dir / "result.json"
-    if not p.exists():
-        return None
-    with open(p) as f:
-        d = json.load(f)
-    return EvalResult(**d)
+def cell_config(method: str, source: str, target: str, seed: int) -> dict:
+    config = {"experiment": "benchmark", "method": method,
+              "source": source, "target": target}
+    if method not in REFERENCE_FREE:
+        config["seed"] = seed
+    return {**config, **method_params(method)}
 
 
-# ── main loop ─────────────────────────────────────────────────────────────────
+def run(methods: list[str], datasets: list[str], seeds: list[int], device: str) -> None:
+    raw = cfg.RESULTS_DIR / "raw"
+    tests = {}
 
-def run(
-    methods: list[str],
-    datasets: list[str],
-    seeds: list[int],
-    device: str,
-    skip_existing: bool,
-    compute_pixel: bool,
-) -> None:
-    results_root = cfg.RESULTS_DIR / "raw"
+    def test_split(name):
+        if name not in tests:
+            tests[name] = build_dataset(name).test()
+        return tests[name]
 
     for method_name in methods:
-        print(f"\n{'='*60}")
-        print(f"METHOD: {method_name}")
-        print(f"{'='*60}")
+        print(f"\n=== {method_name} ===")
+        if method_name in REFERENCE_FREE:
+            banks = [("none", 0)]
+        else:
+            banks = [(src, seed) for src in datasets for seed in seeds]
 
-        # Reference-free methods do not depend on the source dataset at all, so
-        # they are fitted once and evaluated on each target. Running them per
-        # (source, seed) like the others would recompute identical numbers 15
-        # times. WinCLIP+ is NOT in this set: its few-shot variant does use
-        # reference images, which is precisely the contrast being tested.
-        clip_zs_mode = method_name in ("clip_zs", "winclip")
+        for src, seed in banks:
+            pending = []
+            for tgt in datasets:
+                out_dir = raw / method_name / f"seed{seed}" / f"{src}__{tgt}"
+                config = cell_config(method_name, src, tgt, seed)
+                if not cell_done(out_dir, config):
+                    pending.append((tgt, out_dir, config))
+            if not pending:
+                print(f"  [{src}, seed {seed}] all targets done")
+                continue
 
-        method = build_method(method_name, device)
-
-        if clip_zs_mode:
-            method.fit([])  # no-op
-
-        for src_name in datasets:
-            if not clip_zs_mode:
-                # Re-instantiate for each seed-average (or once if no seed variation)
-                for seed in seeds:
-                    # Fitting is the expensive half, so skip it outright when
-                    # every target for this (source, seed) is already stored --
-                    # otherwise a resumed run rebuilds banks it never uses.
-                    if skip_existing and all(
-                        _cell_done(results_root / method_name / f"seed{seed}"
-                                   / f"{src_name}__{t}")
-                        for t in datasets
-                    ):
-                        print(f"\n  [{src_name} (seed={seed})] all targets done, "
-                              f"skipping fit")
-                        continue
-                    src_ds = build_dataset(src_name, seed)
-                    method = build_method(method_name, device)
-                    train_split = src_ds.normal_train()
-                    print(f"\n  Fitting on {src_name} (seed={seed}) …")
-                    method.fit(train_split.image_paths, seed=seed)
-                    _evaluate_all_targets(
-                        method, method_name, src_name, datasets, seed,
-                        results_root, skip_existing, compute_pixel
-                    )
+            model = build_method(method_name, device)
+            if method_name in REFERENCE_FREE:
+                model.fit([])
             else:
-                # CLIP-ZS: single evaluation, no source dependency
-                _evaluate_all_targets(
-                    method, method_name, "none", datasets, 0,
-                    results_root, skip_existing, compute_pixel
-                )
-                break  # only one "source" needed for CLIP-ZS
+                references = build_dataset(src).normal_train().image_paths
+                print(f"  fitting on {src} (seed {seed})")
+                model.fit(references, seed=seed)
 
+            for tgt, out_dir, config in pending:
+                test = test_split(tgt)
+                labels = np.array(test.labels)
+                scores = model.score(test.image_paths)
+                metrics = image_level_metrics(scores, labels)
+                save_cell(out_dir, config,
+                          {"image_auroc": metrics.image_auroc,
+                           "image_ap": metrics.image_ap},
+                          device, scores=scores, labels=labels,
+                          paths=test.image_paths)
+                print(f"    {src} -> {tgt}: AUROC={metrics.image_auroc:.4f}  "
+                      f"AP={metrics.image_ap:.4f}")
 
-def _evaluate_all_targets(
-    method,
-    method_name: str,
-    src_name: str,
-    datasets: list[str],
-    seed: int,
-    results_root: Path,
-    skip_existing: bool,
-    compute_pixel: bool,
-) -> None:
-    for tgt_name in datasets:
-        out_dir = results_root / method_name / f"seed{seed}" / f"{src_name}__{tgt_name}"
-        # A cell counts as done only if the per-image scores are present too,
-        # not just the summary metrics.
-        if skip_existing and _cell_done(out_dir):
-            print(f"    [{src_name} → {tgt_name}] already done, skipping")
-            continue
-
-        print(f"    Evaluating: {src_name} → {tgt_name} …", end=" ", flush=True)
-        tgt_ds = build_dataset(tgt_name, seed)
-        test   = tgt_ds.test()
-
-        scores = method.score(test.image_paths)
-        labels = np.array(test.labels)
-        result = image_level_metrics(scores, labels)
-
-        if compute_pixel:
-            try:
-                smaps = method.score_maps(test.image_paths)
-                p_auroc, p_ap = pixel_level_metrics(smaps, test.mask_paths)
-                result.pixel_auroc = p_auroc
-                result.pixel_ap    = p_ap
-            except NotImplementedError:
-                pass
-
-        save_result(out_dir, result)
-        save_scores(out_dir, scores, labels, test.image_paths)
-        print(f"AUROC={result.image_auroc:.4f}  AP={result.image_ap:.4f}")
-
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--methods",  nargs="+",
-                   default=["dino_patchcore_base", "patchcore", "clip_zs"])
-    p.add_argument("--datasets", nargs="+", default=cfg.DATASET_NAMES)
-    p.add_argument("--seeds",    nargs="+", type=int, default=[0])
-    p.add_argument("--device",   default="cuda" if __import__("torch").cuda.is_available() else "mps" if __import__("torch").backends.mps.is_available() else "cpu")
-    p.add_argument("--skip-existing", action="store_true")
-    p.add_argument("--no-pixel",      action="store_true")
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--methods", nargs="+", choices=METHODS, default=PAPER_METHODS)
+    p.add_argument("--datasets", nargs="+", choices=cfg.DATASETS, default=cfg.DATASETS)
+    p.add_argument("--seeds", nargs="+", type=int, default=cfg.SEEDS,
+                   help="reference-sampling seeds (ignored by reference-free methods)")
+    p.add_argument("--device", default=None,
+                   help="default: $DEVICE, else cuda, mps, cpu")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run(
-        methods=args.methods,
-        datasets=args.datasets,
-        seeds=args.seeds,
-        device=args.device,
-        skip_existing=args.skip_existing,
-        compute_pixel=not args.no_pixel,
-    )
+    run(args.methods, args.datasets, args.seeds, pick_device(args.device))

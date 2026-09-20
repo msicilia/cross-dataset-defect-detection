@@ -1,171 +1,125 @@
-from __future__ import annotations
-"""Controlled memory-bank contamination experiment.
+"""Controlled memory-bank contamination experiment (DINO-PatchCore, ViT-B/14).
 
-Disentangles "does dataset X contaminate the memory bank?" from "did we just give
-the bank fewer good images?" by holding the good-source count fixed and varying
-ONLY what is added.
+For every base source B and seed, three kinds of bank:
 
-For every base source B in {sdnet, mvtec, vision}, and every seed, we build:
+    {B}250         250 reference images of B
+    {B}500         the same 250 plus 250 more of B
+    {B}250+{X}250  the same 250 plus 250 of another source X
 
-    {B}250         : 250 images of B                       (baseline)
-    {B}500         : 500 images of B                       (placebo: +250 MORE of the same)
-    {B}250+{X}250  : the same 250 of B, plus 250 of X      (one per other source X)
+The 250-image core is the first half of one random 500-image draw from B, so it
+is identical across the three kinds for a given seed, and the added 250 images
+of X are the same whichever base they are added to. Every bank is evaluated on
+all three targets, with test sets capped at --max-test by label-stratified
+subsampling.
 
-The 250-image core of B is identical across all conditions for a given seed
-(it is the first 250 of the sampled-500 pool), so {B}500 and {B}250+{X}250 differ
-from {B}250 by exactly +250 images -- the only variable is WHAT those 250 are.
-
-Every bank is evaluated on ALL three targets T (the "exam"), so each role is
-rotated: each dataset serves as base, as added source, and as target. The clean
-contamination quantity is
-
-    Delta(B, X -> T) = AUROC({B}250+{X}250 -> T) - AUROC({B}250 -> T)
-
-with {B}500 -> T as the count-matched control (adding GOOD data should not hurt).
-
-Targets larger than --max-test are stratified-subsampled (label-balanced) per
-seed to bound runtime; this affects absolute AUROC slightly but not the
-count-controlled differences the experiment is about.
-
-Results: results/raw/dino_patchcore_contamination/<config>/seed<s>/<tgt>/result.json
+Results: results/raw/dino_patchcore_contamination/<bank>/seed<s>/<target>/
 
 Usage:
-    python run_contamination.py [--seeds 0 1 2 3 4] [--max-test 2000]
+    python run_contamination.py [--seeds S ...] [--max-test N] [--device cuda|mps|cpu]
 """
+from __future__ import annotations
+
 import argparse
-import json
 import sys
-from pathlib import Path
 
-import numpy as np
-
-sys.path.insert(0, str(Path(__file__).parent))
 import config as cfg
-from datasets import MVTecDataset, SDNETDataset, VISIONDataset
-from methods import DINOPatchCore
+from common import (build_dataset, cell_done, pick_device, random_subset,
+                    save_cell, seeded_rng, stratified_test)
 from evaluate import image_level_metrics
+from methods import DINOPatchCore
 
-DATASETS = ["sdnet", "mvtec", "vision"]
-N_BASE   = 250
-N_ADD    = 250
-
-
-def build_dataset(name: str, seed: int = 0):
-    root = cfg.DATASET_PATHS[name]
-    if name == "mvtec":  return MVTecDataset(root, categories=cfg.MVTEC_CATEGORIES)
-    if name == "sdnet":  return SDNETDataset(root, seed=seed)
-    if name == "vision": return VISIONDataset(root, categories=cfg.VISION_CATEGORIES)
-    raise ValueError(name)
+BACKBONE = cfg.DINOV2_MODELS["base"]
+N_BASE = 250
+N_ADD = 250
 
 
-def _rng(seed: int, tag: int):
-    return np.random.default_rng([seed, tag])
-
-
-def _sample(paths, n, rng):
-    if len(paths) <= n:
-        return list(paths)
-    idx = rng.choice(len(paths), n, replace=False)
-    return [paths[i] for i in sorted(idx)]
-
-
-def _stratified_test(split, max_test: int, seed: int):
-    """Label-balanced subsample of a test split to at most max_test images."""
-    paths  = list(split.image_paths)
-    labels = list(split.labels)
-    if max_test is None or len(paths) <= max_test:
-        return paths, np.array(labels)
-    rng = np.random.default_rng([seed, 7777])
-    idx = np.arange(len(paths))
-    pos = idx[np.array(labels) == 1]
-    neg = idx[np.array(labels) == 0]
-    frac = max_test / len(paths)
-    n_pos = max(1, int(round(len(pos) * frac)))
-    n_neg = max(1, int(round(len(neg) * frac)))
-    keep = np.concatenate([
-        rng.choice(pos, min(n_pos, len(pos)), replace=False),
-        rng.choice(neg, min(n_neg, len(neg)), replace=False),
-    ])
-    keep.sort()
-    return [paths[i] for i in keep], np.array([labels[i] for i in keep])
-
-
-def make_method(device: str):
+def make_method(device: str) -> DINOPatchCore:
+    # The caller fixes the bank, so the detector's own subsampling is disabled.
     return DINOPatchCore(
-        backbone=cfg.DINOV2_MODELS["base"],
+        backbone=BACKBONE,
         device=device,
         coreset_ratio=cfg.PATCHCORE["coreset_ratio"],
-        max_train_images=10_000,   # we control the count ourselves; do not re-subsample
+        max_train_images=sys.maxsize,
         image_size=cfg.PATCHCORE["image_size"],
         batch_size=cfg.PATCHCORE["batch_size"],
     )
 
 
-def run(seeds: list[int], max_test: int | None) -> None:
-    import torch
-    device = ("mps" if torch.backends.mps.is_available()
-              else "cuda" if torch.cuda.is_available() else "cpu")
+def banks(normals: dict[str, list], seed: int) -> dict[str, tuple[dict, list]]:
+    """{bank name: (composition, reference paths)} for one seed."""
+    out = {}
+    for b in cfg.DATASETS:
+        pool = random_subset(normals[b], N_BASE + N_ADD,
+                             seeded_rng(seed, cfg.DATASETS.index(b)))
+        assert len(pool) == N_BASE + N_ADD, f"{b} has too few reference images"
+        core = pool[:N_BASE]
+        out[f"{b}{N_BASE}"] = ({"base": b, "n_base": N_BASE, "added": None, "n_added": 0},
+                               core)
+        out[f"{b}{N_BASE + N_ADD}"] = (
+            {"base": b, "n_base": N_BASE + N_ADD, "added": None, "n_added": 0}, pool)
+        for x in cfg.DATASETS:
+            if x == b:
+                continue
+            add = random_subset(normals[x], N_ADD, seeded_rng(seed, 10 + cfg.DATASETS.index(x)))
+            assert len(add) == N_ADD, f"{x} has too few reference images"
+            out[f"{b}{N_BASE}+{x}{N_ADD}"] = (
+                {"base": b, "n_base": N_BASE, "added": x, "n_added": N_ADD}, core + add)
+    return out
+
+
+def cell_config(composition: dict, seed: int, target: str, max_test: int | None) -> dict:
+    return {
+        "experiment": "contamination",
+        "backbone": BACKBONE,
+        **composition,
+        "seed": seed,
+        "target": target,
+        "max_test": max_test,
+        "coreset_ratio": cfg.PATCHCORE["coreset_ratio"],
+        "image_size": cfg.PATCHCORE["image_size"],
+    }
+
+
+def run(seeds: list[int], max_test: int | None, device: str) -> None:
     out_root = cfg.RESULTS_DIR / "raw" / "dino_patchcore_contamination"
+    datasets = {d: build_dataset(d) for d in cfg.DATASETS}
+    normals = {d: datasets[d].normal_train().image_paths for d in cfg.DATASETS}
     print(f"device={device}  seeds={seeds}  max_test={max_test}")
 
     for seed in seeds:
-        # Pre-build (and cache) the target exams for this seed.
-        targets = {}
-        for t in DATASETS:
-            paths, labels = _stratified_test(build_dataset(t, seed).test(), max_test, seed)
-            targets[t] = (paths, labels)
+        targets = {t: stratified_test(datasets[t].test(), max_test, seed) for t in cfg.DATASETS}
+        for t, (paths, labels) in targets.items():
             print(f"[seed {seed}] target {t}: {len(paths)} test images "
-                  f"({int((labels==1).sum())} defective)")
+                  f"({int(labels.sum())} defective)")
 
-        # Sampled pools per source (500 for bases, 250 for add-ons).
-        normals = {s: build_dataset(s, seed).normal_train().image_paths for s in DATASETS}
-
-        # Build the list of bank configurations.
-        configs: dict[str, list] = {}
-        for B in DATASETS:
-            poolB = _sample(normals[B], 500, _rng(seed, DATASETS.index(B)))
-            base250 = poolB[:N_BASE]
-            configs[f"{B}{N_BASE}"]            = base250            # baseline
-            if len(poolB) >= N_BASE + N_ADD:
-                configs[f"{B}{N_BASE+N_ADD}"]  = poolB[:N_BASE + N_ADD]  # placebo: +250 same
-            for X in DATASETS:
-                if X == B:
-                    continue
-                addX = _sample(normals[X], N_ADD, _rng(seed, 10 + DATASETS.index(X)))
-                configs[f"{B}{N_BASE}+{X}{N_ADD}"] = base250 + addX
-
-        for cfg_name, imgs in configs.items():
-            # Skip if all targets already done for this config/seed.
-            done = all((out_root / cfg_name / f"seed{seed}" / t / "result.json").exists()
-                       for t in DATASETS)
-            if done:
-                print(f"[seed {seed}] {cfg_name}: done, skipping")
+        for name, (composition, refs) in banks(normals, seed).items():
+            cells = {t: (out_root / name / f"seed{seed}" / t,
+                         cell_config(composition, seed, t, max_test))
+                     for t in cfg.DATASETS}
+            pending = {t: c for t, c in cells.items() if not cell_done(*c)}
+            if not pending:
+                print(f"[seed {seed}] {name}: done")
                 continue
 
-            print(f"\n[seed {seed}] building bank '{cfg_name}' ({len(imgs)} images) ...")
+            print(f"\n[seed {seed}] bank {name} ({len(refs)} images)")
             method = make_method(device)
-            method.fit(imgs, seed=seed)
-
-            for t in DATASETS:
-                out_dir = out_root / cfg_name / f"seed{seed}" / t
-                if (out_dir / "result.json").exists():
-                    continue
+            method.fit(refs, seed=seed)
+            for t, (out_dir, config) in pending.items():
                 paths, labels = targets[t]
                 scores = method.score(paths)
                 res = image_level_metrics(scores, labels)
-                out_dir.mkdir(parents=True, exist_ok=True)
-                with open(out_dir / "result.json", "w") as f:
-                    json.dump({"image_auroc": res.image_auroc,
-                               "image_ap": res.image_ap,
-                               "config": cfg_name, "target": t, "seed": seed,
-                               "n_images": len(imgs)}, f, indent=2)
+                save_cell(out_dir, config,
+                          {"image_auroc": res.image_auroc, "image_ap": res.image_ap},
+                          device, scores=scores, labels=labels, paths=paths)
                 print(f"    -> {t}: AUROC={res.image_auroc:.4f}")
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
-    ap.add_argument("--max-test", type=int, default=2000,
-                    help="cap per-target test images (stratified); 0 = no cap")
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--seeds", nargs="+", type=int, default=cfg.SEEDS)
+    ap.add_argument("--max-test", type=int, default=cfg.MAX_TEST,
+                    help="cap on test images per target (label-stratified); 0 = no cap")
+    ap.add_argument("--device", default=None,
+                    help="default: $DEVICE, else cuda, mps, cpu")
     a = ap.parse_args()
-    run(a.seeds, None if a.max_test == 0 else a.max_test)
+    run(a.seeds, a.max_test or None, pick_device(a.device))

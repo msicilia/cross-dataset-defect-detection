@@ -1,23 +1,23 @@
+"""Interface shared by all anomaly detectors."""
 from __future__ import annotations
-"""Abstract base class for all anomaly detection methods."""
+
 from abc import ABC, abstractmethod
 from pathlib import Path
+
 import numpy as np
 
 
 class AnomalyMethod(ABC):
-    """Interface shared by all methods in the benchmark."""
-
-    name: str  # set by subclass
+    name: str
 
     @abstractmethod
     def fit(self, image_paths: list[Path], seed: int = 0) -> None:
-        """Build the anomaly model from defect-free training images."""
+        """Build the normality model from defect-free reference images."""
 
     @abstractmethod
     def score(self, image_paths: list[Path]) -> np.ndarray:
-        """Return an image-level anomaly score for each image (higher = more anomalous)."""
+        """One anomaly score per image; higher means more anomalous."""
 
     def score_maps(self, image_paths: list[Path]) -> list[np.ndarray]:
-        """Return pixel-level anomaly score maps (optional; default raises NotImplementedError)."""
-        raise NotImplementedError(f"{self.name} does not support pixel-level scoring")
+        """Per-pixel anomaly maps, for detectors that provide them."""
+        raise NotImplementedError(f"{self.name} does not produce anomaly maps")

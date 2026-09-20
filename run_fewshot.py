@@ -1,111 +1,92 @@
-from __future__ import annotations
-"""Few-shot training-size ablation for DINO-PatchCore.
+"""Reference-set size sweep for DINO-PatchCore.
 
-Sweeps the number of normal training images available from the source domain
-and measures cross-dataset AUROC on all targets. Quantifies how quickly the
-memory bank becomes useful as reference data grows from zero toward the full
-500-image cap.
+For each seed and source dataset, one pool of 500 defect-free reference images
+is drawn as a random permutation prefix (numpy default_rng(seed)); the bank for
+size n is the first n images of that pool, so smaller sets are nested in larger
+ones. The pool is in random order, so every prefix mixes categories. Each
+bank is scored on the full test split of all three targets.
 
-n_shots sweep: [5, 10, 25, 50, 100, 250, 500]
+Results: results/raw/dino_patchcore_fewshot/n<n>/seed<s>/<source>__<target>/
 
-Results saved to:
-    results/raw/dino_patchcore_fewshot/n<k>/seed<s>/<src>__<tgt>/result.json
+Usage:
+    python run_fewshot.py [--seeds S ...] [--device cuda|mps|cpu]
 """
-import json
-import sys
-from pathlib import Path
+from __future__ import annotations
+
+import argparse
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
 import config as cfg
-from datasets import MVTecDataset, SDNETDataset, VISIONDataset
-from methods import DINOPatchCore
+from common import build_dataset, cell_done, pick_device, random_subset, save_cell
 from evaluate import image_level_metrics
+from methods import DINOPatchCore
 
-DATASETS = ["sdnet", "mvtec", "vision"]
-N_SHOTS  = [5, 10, 25, 50, 100, 250, 500]
-SEEDS    = [0, 1, 2]
-
-
-def build_dataset(name: str, seed: int = 0):
-    root = cfg.DATASET_PATHS[name]
-    if name == "mvtec":
-        return MVTecDataset(root, categories=cfg.MVTEC_CATEGORIES)
-    if name == "sdnet":
-        return SDNETDataset(root, seed=seed)
-    if name == "vision":
-        return VISIONDataset(root, categories=cfg.VISION_CATEGORIES)
-    raise ValueError(name)
+N_SHOTS = [5, 10, 25, 50, 100, 250, 500]
+BACKBONE = cfg.DINOV2_MODELS["base"]
 
 
-def run():
-    device = "mps" if __import__("torch").backends.mps.is_available() else "cpu"
-    results_root = cfg.RESULTS_DIR / "raw" / "dino_patchcore_fewshot"
+def reference_pool(source: str, seed: int) -> list:
+    paths = build_dataset(source).normal_train().image_paths
+    if len(paths) < max(N_SHOTS):
+        raise ValueError(f"{source} has only {len(paths)} reference images")
+    return random_subset(paths, max(N_SHOTS), np.random.default_rng(seed))
 
-    for seed in SEEDS:
-        for src_name in DATASETS:
-            src_ds = build_dataset(src_name, seed)
-            all_train = src_ds.normal_train().image_paths
 
-            # Sample once at the largest size; subsets are nested prefixes
-            rng = np.random.default_rng(seed)
-            max_n = min(max(N_SHOTS), len(all_train))
-            if len(all_train) > max_n:
-                pool_idx = rng.choice(len(all_train), max_n, replace=False)
-                pool = [all_train[i] for i in sorted(pool_idx)]
-            else:
-                pool = list(all_train)
+def cell_config(source: str, target: str, seed: int, n: int) -> dict:
+    return {"experiment": "reference_set_size", "method": "dino_patchcore_base",
+            "backbone": BACKBONE, "source": source, "target": target,
+            "seed": seed, "n": n,
+            "coreset_ratio": cfg.PATCHCORE["coreset_ratio"],
+            "image_size": cfg.PATCHCORE["image_size"]}
 
+
+def run(seeds: list[int], device: str) -> None:
+    root = cfg.RESULTS_DIR / "raw" / "dino_patchcore_fewshot"
+    tests = {}
+
+    for seed in seeds:
+        for src in cfg.DATASETS:
+            pool = None
             for n in N_SHOTS:
-                actual_n = min(n, len(pool))
-                train_paths = pool[:actual_n]
-
-                print(f"\n[seed={seed}  src={src_name}  n={actual_n}]")
-
-                # Check if all targets already done for this (seed, src, n)
-                all_done = all(
-                    (results_root / f"n{actual_n}" / f"seed{seed}"
-                     / f"{src_name}__{tgt}" / "result.json").exists()
-                    for tgt in DATASETS
-                )
-                if all_done:
-                    print("  all targets done, skipping")
+                pending = []
+                for tgt in cfg.DATASETS:
+                    out_dir = root / f"n{n}" / f"seed{seed}" / f"{src}__{tgt}"
+                    config = cell_config(src, tgt, seed, n)
+                    if not cell_done(out_dir, config):
+                        pending.append((tgt, out_dir, config))
+                if not pending:
+                    print(f"[seed {seed}] {src} n={n}: all targets done")
                     continue
 
-                method = DINOPatchCore(
-                    backbone=cfg.DINOV2_MODELS["base"],
-                    device=device,
-                    coreset_ratio=cfg.PATCHCORE["coreset_ratio"],
-                    max_train_images=actual_n + 1,   # allow exactly n images
-                    image_size=cfg.PATCHCORE["image_size"],
-                    batch_size=cfg.PATCHCORE["batch_size"],
-                )
-                method.fit(train_paths, seed=seed)
+                pool = pool or reference_pool(src, seed)
+                print(f"\n[seed {seed}] {src} n={n}: fitting")
+                model = DINOPatchCore(backbone=BACKBONE, device=device,
+                                      coreset_ratio=cfg.PATCHCORE["coreset_ratio"],
+                                      max_train_images=n,
+                                      image_size=cfg.PATCHCORE["image_size"],
+                                      batch_size=cfg.PATCHCORE["batch_size"])
+                model.fit(pool[:n], seed=seed)
 
-                for tgt_name in DATASETS:
-                    out_dir = (results_root / f"n{actual_n}" / f"seed{seed}"
-                               / f"{src_name}__{tgt_name}")
-                    if (out_dir / "result.json").exists():
-                        print(f"  → {tgt_name}: already done")
-                        continue
-
-                    tgt_ds = build_dataset(tgt_name, seed)
-                    test = tgt_ds.test()
-                    scores = method.score(test.image_paths)
+                for tgt, out_dir, config in pending:
+                    if tgt not in tests:
+                        tests[tgt] = build_dataset(tgt).test()
+                    test = tests[tgt]
                     labels = np.array(test.labels)
-                    result = image_level_metrics(scores, labels)
-
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    with open(out_dir / "result.json", "w") as f:
-                        json.dump({"image_auroc": result.image_auroc,
-                                   "image_ap": result.image_ap,
-                                   "n_train": actual_n,
-                                   "src": src_name,
-                                   "tgt": tgt_name,
-                                   "seed": seed}, f, indent=2)
-                    print(f"  → {tgt_name}: AUROC={result.image_auroc:.4f}")
+                    scores = model.score(test.image_paths)
+                    metrics = image_level_metrics(scores, labels)
+                    save_cell(out_dir, config,
+                              {"image_auroc": metrics.image_auroc,
+                               "image_ap": metrics.image_ap},
+                              device, scores=scores, labels=labels,
+                              paths=test.image_paths)
+                    print(f"    {src} -> {tgt}: AUROC={metrics.image_auroc:.4f}")
 
 
 if __name__ == "__main__":
-    run()
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--seeds", nargs="+", type=int, default=cfg.SUBSET_SEEDS)
+    ap.add_argument("--device", default=None,
+                    help="default: $DEVICE, else cuda, mps, cpu")
+    a = ap.parse_args()
+    run(a.seeds, pick_device(a.device))

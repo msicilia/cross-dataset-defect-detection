@@ -1,46 +1,49 @@
-"""Central configuration for all experiments."""
+"""Configuration shared by all experiments."""
 from pathlib import Path
 
-# ── Dataset root directories ──────────────────────────────────────────────────
+# ── datasets ──────────────────────────────────────────────────────────────────
 DATA_ROOT = Path("data")
 
 DATASET_PATHS = {
-    "mvtec":  DATA_ROOT / "mvtec_anomaly_detection",
     "sdnet":  DATA_ROOT / "sdnet2018",
+    "mvtec":  DATA_ROOT / "mvtec_anomaly_detection",
     "vision": DATA_ROOT / "vision_dataset",
 }
+DATASETS = ["sdnet", "mvtec", "vision"]
 
-# MVTec categories used (flat-surface textures + metallic objects)
+# Two metallic objects (metal_nut, screw) and three flat textures.
 MVTEC_CATEGORIES = ["metal_nut", "screw", "tile", "wood", "grid"]
 
-# VISION dataset — metallic/mechanical surface categories.
-# Full list: Cable, Capacitor, Casting, Console, Cylinder, Electronics,
-#            Groove, Hemisphere, Lens, PCB_1, PCB_2, Ring, Screw, Wood
+# The VISION metallic subsets used.
 VISION_CATEGORIES = ["Casting", "Ring", "Screw", "Cylinder"]
 
-# ── Model identifiers ─────────────────────────────────────────────────────────
+# ── models ────────────────────────────────────────────────────────────────────
 DINOV2_MODELS = {
-    "small":  "facebook/dinov2-small",   # ViT-S/14
-    "base":   "facebook/dinov2-base",    # ViT-B/14
-    "large":  "facebook/dinov2-large",   # ViT-L/14
+    "small": "facebook/dinov2-small",   # ViT-S/14
+    "base":  "facebook/dinov2-base",    # ViT-B/14
+    "large": "facebook/dinov2-large",   # ViT-L/14
 }
-DINOV2_DEFAULT = "base"
+CLIP_MODEL = "openai/clip-vit-large-patch14"
 
-CLIP_MODEL   = "openai/clip-vit-large-patch14"
-WRNET_LAYERS = ("layer2", "layer3")          # WideResNet-50 layers for PatchCore
-
-# ── Method hyperparameters ────────────────────────────────────────────────────
+# ── detectors ─────────────────────────────────────────────────────────────────
 PATCHCORE = {
-    "coreset_ratio":    0.01,   # fraction of patch features to keep in memory bank
-    "max_train_images": 500,    # cap to avoid OOM on large datasets
+    # PatchCore, DINO-PatchCore: fraction of all reference patches kept.
+    "coreset_ratio":    0.01,
+    # All reference-based detectors (PatchCore, DINO-PatchCore, SPADE, PaDiM,
+    # WinCLIP+): reference images drawn per source bank.
+    "max_train_images": 500,
+    # DINO-PatchCore: square resize before the processor's crop; also the frame
+    # of the VISION masks (vision_masks.py).
     "image_size":       256,
+    # PatchCore, SPADE, PaDiM (WideResNet-50) and DINO-PatchCore.
     "batch_size":       32,
 }
 
 CLIP_ZS = {
     "image_size": 224,
     "batch_size": 64,
-    # Prompt pairs per defect category: (positive, negative)
+    # Prompt pairs per defect category: (positive, negative). The image score
+    # is the largest positive-class probability over all pairs.
     "prompts": {
         "crack": [
             ("a photo of a concrete wall with a crack",
@@ -69,27 +72,24 @@ CLIP_ZS = {
     },
 }
 
-# ── Experiment settings ───────────────────────────────────────────────────────
-SEEDS        = [0, 1, 2, 3, 4]
-RESULTS_DIR  = Path("results")
-FIGURES_DIR  = Path("figures")
-
-DATASET_NAMES = ["mvtec", "sdnet", "vision"]
-METHODS       = ["dino_patchcore_small", "dino_patchcore_base",
-                 "dino_patchcore_large", "patchcore", "spade", "padim",
-                 "winclip", "winclip_plus", "clip_zs"]
-DINO_VARIANTS = ["small", "base", "large"]
-
-# SPADE: k nearest reference images averaged for the image-level score
-# (k=50 as in the original SPADE paper; capped at the reference set size
-# at run time.)
+# SPADE: k nearest reference images averaged for the image score (Cohen and
+# Hoshen use k=50; capped at the reference set size).
 SPADE = {"k": 50}
 
-# PaDiM: dimension of the random channel subset per patch position. Must stay
-# well below max_train_images or the per-position covariance is rank-deficient;
-# with a 500-image reference cap, 200 keeps N/d = 2.5.
-PADIM = {"n_dims": 200}
+# PaDiM: n_dims random feature channels per patch position (the covariance of
+# each position needs more reference images than channels); eps is the
+# covariance regulariser as a fraction of the mean per-channel variance.
+PADIM = {"n_dims": 200, "eps": 0.01}
 
-# WinCLIP: each image expands to 1 + 4 + 9 = 14 windows, so the effective CLIP
-# batch is 14x this. Kept small to bound memory on ViT-L/14.
+# WinCLIP: each image expands to 1 + 4 + 9 = 14 windows, so the CLIP batch is
+# 14 times this.
 WINCLIP = {"batch_size": 8}
+
+# ── experiments ───────────────────────────────────────────────────────────────
+SEEDS = [0, 1, 2, 3, 4]
+SUBSET_SEEDS = [0, 1, 2]     # mixed-source and reference-set-size experiments
+CONFOUNDER_SEEDS = [0]       # confounder ablation
+# Label-stratified cap on target test sets in the contamination, proportion,
+# MVTec-split and confounder experiments; only SDNET2018 exceeds it.
+MAX_TEST = 2000
+RESULTS_DIR = Path("results")

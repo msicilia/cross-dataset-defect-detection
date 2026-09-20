@@ -1,12 +1,17 @@
-from __future__ import annotations
-"""PatchCore baseline with a WideResNet-50 backbone (supervised ImageNet features).
+"""PatchCore with a WideResNet-50 backbone (supervised ImageNet features).
 
-Identical memory-bank logic to DINOPatchCore; only the feature extractor differs.
-This isolates the contribution of the DINOv2 backbone.
+Same memory-bank procedure as DINOPatchCore: greedy farthest-point coreset of
+a coreset_ratio fraction of all reference patches; image score = max over
+patches of the distance to the nearest coreset vector. Patch features are
+layer2 (28x28) concatenated with layer3 (14x14) repeated to 28x28 by adaptive
+average pooling, 1536-d. Unlike Roth et al. there is no local neighbourhood
+aggregation and no random projection.
 
 Reference:
     Roth et al., "Towards Total Recall in Industrial Anomaly Detection", CVPR 2022.
 """
+from __future__ import annotations
+
 from pathlib import Path
 
 import numpy as np
@@ -18,14 +23,20 @@ from tqdm import tqdm
 
 from .base import AnomalyMethod
 from .dino_patchcore import _greedy_coreset
+from .imageio import load_all
 
-
+# Square resize before the centre crop, as for DINO-PatchCore, so the crop keeps
+# the same central region of every image whatever its aspect ratio.
 _TRANSFORM = transforms.Compose([
-    transforms.Resize(256),
+    transforms.Resize((256, 256)),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
+
+
+def _load(path: Path) -> torch.Tensor:
+    return _TRANSFORM(Image.open(path).convert("RGB"))
 
 
 class PatchCore(AnomalyMethod):
@@ -50,7 +61,6 @@ class PatchCore(AnomalyMethod):
         for p in backbone.parameters():
             p.requires_grad_(False)
 
-        # Register forward hooks to capture intermediate feature maps
         self._features: dict[str, torch.Tensor] = {}
         for layer_name in layers:
             getattr(backbone, layer_name).register_forward_hook(
@@ -60,8 +70,14 @@ class PatchCore(AnomalyMethod):
         self.memory_bank: np.ndarray | None = None
 
     def _load_batch(self, paths: list[Path]) -> torch.Tensor:
-        imgs = [_TRANSFORM(Image.open(p).convert("RGB")) for p in paths]
-        return torch.stack(imgs).to(self.device)
+        return torch.stack(load_all(_load, paths)).to(self.device)
+
+    def _patches(self) -> torch.Tensor:
+        """(B*28*28, C) patch features from the hooked layers of the last forward pass."""
+        feats = [F.adaptive_avg_pool2d(self._features[n], (28, 28)) for n in self.layers]
+        combined = torch.cat(feats, dim=1)  # (B, C, 28, 28)
+        B, C, H, W = combined.shape
+        return combined.permute(0, 2, 3, 1).reshape(B * H * W, C)
 
     @torch.no_grad()
     def _extract(self, paths: list[Path]) -> np.ndarray:
@@ -70,16 +86,7 @@ class PatchCore(AnomalyMethod):
             batch = self._load_batch(paths[i : i + self.batch_size])
             self._features.clear()
             self.backbone(batch)
-            feats = []
-            for name in self.layers:
-                f = self._features[name]  # (B, C, H, W)
-                # adaptive pool to common spatial size (H=28, W=28)
-                f = F.adaptive_avg_pool2d(f, output_size=(28, 28))
-                feats.append(f)
-            combined = torch.cat(feats, dim=1)  # (B, C_total, 28, 28)
-            B, C, H, W = combined.shape
-            patches = combined.permute(0, 2, 3, 1).reshape(B * H * W, C)
-            all_patches.append(patches.cpu().numpy())
+            all_patches.append(self._patches().cpu().numpy())
         return np.concatenate(all_patches, axis=0)
 
     def fit(self, image_paths: list[Path], seed: int = 0) -> None:
@@ -93,7 +100,7 @@ class PatchCore(AnomalyMethod):
         features = self._extract(paths)
         target = max(1, int(len(features) * self.coreset_ratio))
         print(f"  [patchcore] building coreset: {len(features)} → {target} …")
-        self.memory_bank = _greedy_coreset(features, target, seed=seed, pre_sample=50_000)
+        self.memory_bank = _greedy_coreset(features, target, seed=seed)
 
     def _nn_distances(self, patches: np.ndarray) -> np.ndarray:
         mb = torch.tensor(self.memory_bank, dtype=torch.float32)
@@ -105,17 +112,13 @@ class PatchCore(AnomalyMethod):
 
     @torch.no_grad()
     def score(self, image_paths: list[Path]) -> np.ndarray:
-        assert self.memory_bank is not None
+        assert self.memory_bank is not None, "Call fit() first"
         scores = []
         for i in tqdm(range(0, len(image_paths), self.batch_size), desc="scoring [patchcore]"):
             batch_paths = image_paths[i : i + self.batch_size]
-            batch = self._load_batch(batch_paths)
             self._features.clear()
-            self.backbone(batch)
-            feats = [F.adaptive_avg_pool2d(self._features[n], (28, 28)) for n in self.layers]
-            combined = torch.cat(feats, dim=1)  # (B, C, 28, 28)
-            B, C, H, W = combined.shape
-            patches = combined.permute(0, 2, 3, 1).reshape(B * H * W, C).cpu().numpy()
-            dists = self._nn_distances(patches).reshape(B, H * W)
+            self.backbone(self._load_batch(batch_paths))
+            patches = self._patches().cpu().numpy()
+            dists = self._nn_distances(patches).reshape(len(batch_paths), -1)
             scores.append(dists.max(axis=1))
         return np.concatenate(scores)

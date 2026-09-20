@@ -1,15 +1,19 @@
-from __future__ import annotations
 """DINO-PatchCore: PatchCore anomaly detection with a frozen DINOv2 backbone.
 
-Memory bank is built from patch tokens of defect-free training images.
-Image-level score: max nearest-neighbour distance across all image patches.
-Pixel-level map: per-patch NN distance, upsampled to input resolution.
+Memory bank: greedy farthest-point coreset of the patch tokens of defect-free
+reference images. Image score: max over patches of the distance to the nearest
+coreset vector. Pixel map: per-patch distance, upsampled over the centre crop
+the backbone sees (map_box).
 
-Reference:
+References:
     Roth et al., "Towards Total Recall in Industrial Anomaly Detection",
     CVPR 2022 (PatchCore).
     Oquab et al., "DINOv2", TMLR 2023.
 """
+from __future__ import annotations
+
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -20,32 +24,38 @@ from tqdm import tqdm
 from transformers import AutoImageProcessor, AutoModel
 
 from .base import AnomalyMethod
+from .imageio import load_all
+
+_CORESET_CHUNK = 16384
 
 
-def _greedy_coreset(
-    features: np.ndarray,
-    target_size: int,
-    seed: int = 0,
-    pre_sample: int | None = None,
-) -> np.ndarray:
-    """Greedy farthest-point sampling with optional random pre-sampling.
+def _greedy_coreset(features: np.ndarray, target_size: int, seed: int = 0) -> np.ndarray:
+    """Greedy farthest-point (k-center) selection over all features.
 
-    Pass pre_sample to bound O(n * target_size) complexity when n is large
-    (e.g., PatchCore with 400k ResNet patches). Leave None to use all features.
+    Distances to each new centre are updated in row chunks on a thread pool.
+    Every row's norm is computed exactly as over the whole array, so the
+    selection does not depend on the chunking or the number of threads.
     """
-    rng = np.random.default_rng(seed)
     n = len(features)
-    if pre_sample is not None and n > pre_sample:
-        idx = rng.choice(n, pre_sample, replace=False)
-        features = features[idx]
-        n = pre_sample
+    if n == 0 or target_size < 1:
+        raise ValueError(f"coreset needs features and target_size >= 1 "
+                         f"(got {n} features, target_size={target_size})")
+    rng = np.random.default_rng(seed)
     target_size = min(target_size, n)
     selected = [int(rng.integers(n))]
     min_dists = np.full(n, np.inf, dtype=np.float32)
-    for _ in range(target_size - 1):
-        d = np.linalg.norm(features - features[selected[-1]], axis=1).astype(np.float32)
-        np.minimum(min_dists, d, out=min_dists)
-        selected.append(int(np.argmax(min_dists)))
+    bounds = [(s, min(s + _CORESET_CHUNK, n)) for s in range(0, n, _CORESET_CHUNK)]
+
+    def update(bound, centre):
+        s, e = bound
+        d = np.linalg.norm(features[s:e] - centre, axis=1).astype(np.float32)
+        np.minimum(min_dists[s:e], d, out=min_dists[s:e])
+
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
+        for _ in range(target_size - 1):
+            centre = features[selected[-1]]
+            list(pool.map(lambda b: update(b, centre), bounds))
+            selected.append(int(np.argmax(min_dists)))
     return features[selected]
 
 
@@ -59,11 +69,8 @@ class DINOPatchCore(AnomalyMethod):
         image_size: int = 256,
         batch_size: int = 16,
         device: str | None = None,
-        # Optional image-space normalisation applied identically to reference
-        # and test images, used by the confounder ablations (run_confounders.py)
-        # to strip one candidate explanation at a time -- colour, illumination,
-        # or resolution -- and see whether the transfer gap survives without it.
-        # None reproduces the standard pipeline exactly.
+        # Optional transform applied after resizing, identically to reference
+        # and test images (run_confounders.py).
         preprocess=None,
         variant: str = "",
     ):
@@ -76,13 +83,14 @@ class DINOPatchCore(AnomalyMethod):
         self.batch_size = batch_size
         self.device = device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
-        self.processor = AutoImageProcessor.from_pretrained(backbone)
+        # The slow processor is the one these checkpoints ship with; pinning it
+        # keeps preprocessing fixed if the transformers default changes.
+        self.processor = AutoImageProcessor.from_pretrained(backbone, use_fast=False)
         self.model = AutoModel.from_pretrained(backbone).to(self.device).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
 
         self.memory_bank: np.ndarray | None = None
-        self._patch_hw: tuple[int, int] | None = None  # (H_patches, W_patches)
 
     # ── feature extraction ────────────────────────────────────────────────────
 
@@ -90,8 +98,6 @@ class DINOPatchCore(AnomalyMethod):
         img = Image.open(path).convert("RGB").resize(
             (self.image_size, self.image_size), Image.BILINEAR
         )
-        # Applied after resizing so every variant sees the same geometry, and to
-        # both reference and test images so the two are never mismatched.
         return self.preprocess(img) if self.preprocess is not None else img
 
     @torch.no_grad()
@@ -99,17 +105,11 @@ class DINOPatchCore(AnomalyMethod):
         """Returns array of shape (N_patches_total, D)."""
         all_patches = []
         for i in tqdm(range(0, len(paths), self.batch_size), desc="extracting", leave=False):
-            batch_paths = paths[i : i + self.batch_size]
-            images = [self._load_image(p) for p in batch_paths]
+            images = load_all(self._load_image, paths[i : i + self.batch_size])
             inputs = self.processor(images=images, return_tensors="pt").to(self.device)
             outputs = self.model(**inputs)
-            # patch tokens: last_hidden_state[:, 1:, :] (skip CLS token)
-            patch_tokens = outputs.last_hidden_state[:, 1:, :]  # (B, P, D)
+            patch_tokens = outputs.last_hidden_state[:, 1:, :]  # (B, P, D), CLS dropped
             B, P, D = patch_tokens.shape
-            # remember spatial layout from first batch
-            if self._patch_hw is None:
-                side = int(P ** 0.5)
-                self._patch_hw = (side, side)
             all_patches.append(patch_tokens.reshape(B * P, D).cpu().numpy())
         return np.concatenate(all_patches, axis=0)
 
@@ -119,8 +119,7 @@ class DINOPatchCore(AnomalyMethod):
         maps = []
         for i in tqdm(range(0, len(paths), self.batch_size),
                       desc=f"score_maps [{self.name}]", leave=False):
-            batch_paths = paths[i : i + self.batch_size]
-            images = [self._load_image(p) for p in batch_paths]
+            images = load_all(self._load_image, paths[i : i + self.batch_size])
             inputs = self.processor(images=images, return_tensors="pt").to(self.device)
             outputs = self.model(**inputs)
             patch_tokens = outputs.last_hidden_state[:, 1:, :]  # (B, P, D)
@@ -150,7 +149,7 @@ class DINOPatchCore(AnomalyMethod):
     # ── score ─────────────────────────────────────────────────────────────────
 
     def _nn_distances(self, patch_features: np.ndarray) -> np.ndarray:
-        """Compute nearest-neighbour distance of each patch to the memory bank."""
+        """Distance of each patch to its nearest memory-bank vector."""
         mb = torch.tensor(self.memory_bank, dtype=torch.float32)  # (M, D)
         chunk_size = 2048
         dists = []
@@ -160,36 +159,47 @@ class DINOPatchCore(AnomalyMethod):
             dists.append(d.numpy())
         return np.concatenate(dists)
 
+    @torch.no_grad()
     def score(self, image_paths: list[Path]) -> np.ndarray:
         assert self.memory_bank is not None, "Call fit() first"
         scores = []
         for i in tqdm(range(0, len(image_paths), self.batch_size), desc=f"scoring [{self.name}]"):
-            batch = image_paths[i : i + self.batch_size]
-            images = [self._load_image(p) for p in batch]
+            images = load_all(self._load_image, image_paths[i : i + self.batch_size])
             inputs = self.processor(images=images, return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                outputs = self.model(**inputs)
+            outputs = self.model(**inputs)
             patches = outputs.last_hidden_state[:, 1:, :]  # (B, P, D)
             B, P, D = patches.shape
             flat = patches.reshape(B * P, D).cpu().numpy()
             dists = self._nn_distances(flat).reshape(B, P)
-            scores.append(dists.max(axis=1))  # image score = max patch distance
+            scores.append(dists.max(axis=1))
         return np.concatenate(scores)
 
+    def map_box(self) -> tuple[int, int, int]:
+        """(top, left, size) of the region the patch grid covers, in the
+        image_size x image_size frame produced by _load_image.
+
+        The DINOv2 processor resizes the shortest edge and centre-crops (256 to
+        224 for the public checkpoints), so masks must be cropped to this box.
+        """
+        p = self.processor
+        side = (p.size.get("shortest_edge") or p.size.get("height")) if p.do_resize \
+            else self.image_size
+        crop = p.crop_size["height"] if p.do_center_crop else side
+        scale = self.image_size / side
+        offset = int(round(((side - crop) // 2) * scale))
+        return offset, offset, int(round(crop * scale))
+
     def score_maps(self, image_paths: list[Path]) -> list[np.ndarray]:
+        """Per-pixel maps covering map_box(), not the full loaded image."""
         assert self.memory_bank is not None, "Call fit() first"
-        # _extract_patch_maps slices its argument and calls len() on it, so it
-        # needs a real sequence rather than an iterator. Progress is reported
-        # inside the extractor.
         patch_maps = self._extract_patch_maps(list(image_paths))
+        _, _, size = self.map_box()
         result = []
         for fmap in patch_maps:
             H, W, D = fmap.shape
             flat = fmap.reshape(H * W, D)
             dists = self._nn_distances(flat).reshape(H, W)
-            # bilinear upsample to image_size
             t = torch.tensor(dists[None, None]).float()
-            t = F.interpolate(t, size=(self.image_size, self.image_size), mode="bilinear",
-                              align_corners=False)
+            t = F.interpolate(t, size=(size, size), mode="bilinear", align_corners=False)
             result.append(t[0, 0].numpy())
         return result

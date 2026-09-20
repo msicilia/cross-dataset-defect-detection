@@ -1,105 +1,98 @@
-from __future__ import annotations
-"""Mixed-source memory bank experiment.
+"""Mixed-source memory banks for DINO-PatchCore.
 
-Fits DINO-PatchCore on the combined normal training images from two source
-datasets and evaluates on all three target datasets. Tests the paper's
-recommendation that a mixed bank outperforms any single-domain bank when the
-target domain is heterogeneous.
+For each pair of source datasets and each seed, the memory bank is built from
+250 defect-free reference images of each source (500 in total) and scored on
+the full test split of all three targets.
 
-Source combinations (leave-one-out):
-    sdnet + mvtec  → evaluate on vision, sdnet, mvtec
-    sdnet + vision → evaluate on mvtec, sdnet, vision
-    mvtec + vision → evaluate on sdnet, mvtec, vision
+The reference images come from one generator, numpy default_rng(seed), used
+for both sources in pair order: 250 indices without replacement from the first
+source's reference list, then 250 from the second's.
 
-Results saved to:
-    results/raw/dino_patchcore_mixed/seed<s>/<src1>+<src2>__<tgt>/result.json
+Results: results/raw/dino_patchcore_mixed/seed<s>/<src1>+<src2>__<target>/
+
+Usage:
+    python run_mixed_source.py [--seeds S ...] [--device cuda|mps|cpu]
 """
-import json
-import sys
-from pathlib import Path
+from __future__ import annotations
+
+import argparse
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
 import config as cfg
-from datasets import MVTecDataset, SDNETDataset, VISIONDataset
-from methods import DINOPatchCore
+from common import build_dataset, cell_done, pick_device, save_cell
 from evaluate import image_level_metrics
+from methods import DINOPatchCore
 
-DATASETS = ["sdnet", "mvtec", "vision"]
-SEEDS = [0, 1, 2]
-MAX_PER_SOURCE = 250   # 250×2 = 500 total, same cap as single-source
-
-
-def build_dataset(name: str, seed: int = 0):
-    root = cfg.DATASET_PATHS[name]
-    if name == "mvtec":
-        return MVTecDataset(root, categories=cfg.MVTEC_CATEGORIES)
-    if name == "sdnet":
-        return SDNETDataset(root, seed=seed)
-    if name == "vision":
-        return VISIONDataset(root, categories=cfg.VISION_CATEGORIES)
-    raise ValueError(name)
+PAIRS = [("sdnet", "mvtec"), ("sdnet", "vision"), ("mvtec", "vision")]
+PER_SOURCE = 250
+BACKBONE = cfg.DINOV2_MODELS["base"]
 
 
-def run():
-    device = "mps" if __import__("torch").backends.mps.is_available() else "cpu"
-    results_root = cfg.RESULTS_DIR / "raw" / "dino_patchcore_mixed"
+def reference_images(pair: tuple[str, str], seed: int) -> list:
+    rng = np.random.default_rng(seed)
+    images = []
+    for src in pair:
+        paths = build_dataset(src).normal_train().image_paths
+        idx = rng.choice(len(paths), PER_SOURCE, replace=False)
+        images.extend(paths[i] for i in idx)
+    return images
 
-    pairs = [
-        ("sdnet", "mvtec"),
-        ("sdnet", "vision"),
-        ("mvtec", "vision"),
-    ]
 
-    for seed in SEEDS:
-        for src1_name, src2_name in pairs:
-            key = f"{src1_name}+{src2_name}"
-            print(f"\n{'='*60}")
-            print(f"Mixed source: {key}  seed={seed}")
-            print(f"{'='*60}")
+def cell_config(pair: tuple[str, str], target: str, seed: int) -> dict:
+    return {"experiment": "mixed_source", "method": "dino_patchcore_base",
+            "backbone": BACKBONE, "sources": list(pair), "target": target,
+            "seed": seed, "reference_images_per_source": PER_SOURCE,
+            "coreset_ratio": cfg.PATCHCORE["coreset_ratio"],
+            "image_size": cfg.PATCHCORE["image_size"]}
 
-            # Collect normal training images from both sources
-            rng = np.random.default_rng(seed)
-            combined_paths = []
-            for src_name in (src1_name, src2_name):
-                ds = build_dataset(src_name, seed)
-                paths = ds.normal_train().image_paths
-                if len(paths) > MAX_PER_SOURCE:
-                    idx = rng.choice(len(paths), MAX_PER_SOURCE, replace=False)
-                    paths = [paths[i] for i in idx]
-                combined_paths.extend(paths)
 
-            print(f"  Combined training set: {len(combined_paths)} images")
+def run(seeds: list[int], device: str) -> None:
+    root = cfg.RESULTS_DIR / "raw" / "dino_patchcore_mixed"
+    tests = {}
 
-            method = DINOPatchCore(
-                backbone=cfg.DINOV2_MODELS["base"],
-                device=device,
-                **{k: v for k, v in cfg.PATCHCORE.items() if k != "image_size"},
-                image_size=cfg.PATCHCORE["image_size"],
-            )
-            # Override max_train_images to allow the combined set
-            method.max_train_images = len(combined_paths) + 1
-            method.fit(combined_paths, seed=seed)
+    for seed in seeds:
+        for pair in PAIRS:
+            key = "+".join(pair)
+            pending = []
+            for tgt in cfg.DATASETS:
+                out_dir = root / f"seed{seed}" / f"{key}__{tgt}"
+                config = cell_config(pair, tgt, seed)
+                if not cell_done(out_dir, config):
+                    pending.append((tgt, out_dir, config))
+            if not pending:
+                print(f"[seed {seed}] {key}: all targets done")
+                continue
 
-            for tgt_name in DATASETS:
-                out_dir = results_root / f"seed{seed}" / f"{key}__{tgt_name}"
-                if (out_dir / "result.json").exists():
-                    print(f"  [{key} → {tgt_name}] already done, skipping")
-                    continue
+            images = reference_images(pair, seed)
+            print(f"\n[seed {seed}] {key}: fitting on {len(images)} images")
+            # The cap equals the bank size, so fit keeps every selected image.
+            model = DINOPatchCore(backbone=BACKBONE, device=device,
+                                  coreset_ratio=cfg.PATCHCORE["coreset_ratio"],
+                                  max_train_images=len(images),
+                                  image_size=cfg.PATCHCORE["image_size"],
+                                  batch_size=cfg.PATCHCORE["batch_size"])
+            model.fit(images, seed=seed)
 
-                tgt_ds = build_dataset(tgt_name, seed)
-                test = tgt_ds.test()
-                scores = method.score(test.image_paths)
+            for tgt, out_dir, config in pending:
+                if tgt not in tests:
+                    tests[tgt] = build_dataset(tgt).test()
+                test = tests[tgt]
                 labels = np.array(test.labels)
-                result = image_level_metrics(scores, labels)
-
-                out_dir.mkdir(parents=True, exist_ok=True)
-                with open(out_dir / "result.json", "w") as f:
-                    json.dump({"image_auroc": result.image_auroc,
-                               "image_ap": result.image_ap}, f, indent=2)
-                print(f"  [{key} → {tgt_name}]  AUROC={result.image_auroc:.4f}")
+                scores = model.score(test.image_paths)
+                metrics = image_level_metrics(scores, labels)
+                save_cell(out_dir, config,
+                          {"image_auroc": metrics.image_auroc,
+                           "image_ap": metrics.image_ap},
+                          device, scores=scores, labels=labels,
+                          paths=test.image_paths)
+                print(f"    {key} -> {tgt}: AUROC={metrics.image_auroc:.4f}")
 
 
 if __name__ == "__main__":
-    run()
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--seeds", nargs="+", type=int, default=cfg.SUBSET_SEEDS)
+    ap.add_argument("--device", default=None,
+                    help="default: $DEVICE, else cuda, mps, cpu")
+    a = ap.parse_args()
+    run(a.seeds, pick_device(a.device))

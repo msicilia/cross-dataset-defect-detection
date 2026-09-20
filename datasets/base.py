@@ -1,5 +1,7 @@
+"""Split representation, dataset interface and manifest reader."""
 from __future__ import annotations
-"""Abstract base class for all defect datasets."""
+
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,17 +23,17 @@ class DefectDataset(ABC):
 
     @abstractmethod
     def normal_train(self) -> DatasetSplit:
-        """Defect-free training images (used to build anomaly model)."""
+        """Defect-free reference images used to build the normality model."""
 
     @abstractmethod
     def test(self) -> DatasetSplit:
         """Test split with labels and optional pixel masks."""
 
-    def __repr__(self) -> str:
-        tr = self.normal_train()
-        te = self.test()
-        n_def = sum(te.labels)
-        return (
-            f"{self.name}: {len(tr.image_paths)} normal train | "
-            f"{len(te.image_paths)} test ({n_def} defective)"
-        )
+
+def read_manifest(root: Path, name: str) -> list[dict]:
+    """Records of <root>/manifest_<name>.json, in file order."""
+    p = Path(root) / f"manifest_{name}.json"
+    if not p.exists():
+        raise FileNotFoundError(f"{p} not found; run preprocess.py first")
+    with open(p) as f:
+        return json.load(f)

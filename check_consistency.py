@@ -1,127 +1,186 @@
-from __future__ import annotations
-"""Consistency audit over every result in the tree.
+"""Integrity checks for the result sets used in the paper.
 
-Run before touching the manuscript. Four independent checks:
+For every result set under results/raw/, the number of complete cells (cells
+with a result.json) is compared with the protocol, and every cell is checked:
 
-  1. INTEGRITY   every scores.npz reproduces the result.json beside it
-  2. COMPLETENESS every experiment set has the cell count it should
-  3. SANITY      no AUROC outside [0,1], no NaN, no empty score vector
-  4. PROVENANCE  no result file predates the code that produced it, which is
-                 how a silently inconsistent set would look (the SPADE layer
-                 change came within two minutes of causing exactly that)
+  - result.json parses and records the cell's "config";
+  - scores.npz holds scores, labels and paths of equal length, with finite
+    scores;
+  - every path belongs to the test split of a dataset as returned by its loader,
+    with the same label; for sets scored on a whole target test split, paths
+    and labels equal that split in order;
+  - the stored image_auroc equals the AUROC recomputed from scores.npz.
+
+Expected cell counts are derived from the protocol constants of the runner
+scripts and config.py. Directories not listed in RESULT_SETS are ignored. Exits
+with status 1 if any check fails.
 
 Usage:  python check_consistency.py
 """
+from __future__ import annotations
+
+import argparse
 import json
 import sys
-from pathlib import Path
+from collections import defaultdict
+from dataclasses import dataclass
 
 import numpy as np
 from sklearn.metrics import roc_auc_score
 
-ROOT = Path("results/raw")
-CODE = Path(".")
+import config as cfg
+import run_contamination
+import run_proportions
+from common import build_dataset
+from run_confounders import ARMS
+from run_experiments import REFERENCE_FREE as BENCHMARK_REFERENCE_FREE
+from run_experiments import METHODS
+from run_fewshot import N_SHOTS
+from run_localisation import TARGETS as LOCALISATION_TARGETS
+from ablate_spade_layers import ARMS as SPADE_LAYER_ARMS
+from run_mixed_source import PAIRS
+from run_mvtec_split import GROUPS
 
-EXPECTED = {
-    "patchcore": 45, "dino_patchcore_base": 45, "dino_patchcore_small": 45,
-    "dino_patchcore_large": 45, "spade": 45, "padim": 45, "clip_zs": 3,
-    "dino_patchcore_mvtecsplit": 80, "dino_patchcore_mixed": 27,
-    "dino_patchcore_contamination": 180, "dino_patchcore_fewshot": 189,
-    "dino_patchcore_proportions": 150, "dino_patchcore_confounders": 36,
-}
-# Which source file governs which result set, for the provenance check.
-GOVERNS = {
-    "patchcore": "methods/patchcore.py", "spade": "methods/spade.py",
-    "padim": "methods/padim.py",
-    **{k: "methods/dino_patchcore.py" for k in
-       ("dino_patchcore_base", "dino_patchcore_small", "dino_patchcore_large",
-        "dino_patchcore_mvtecsplit", "dino_patchcore_mixed",
-        "dino_patchcore_contamination", "dino_patchcore_fewshot",
-        "dino_patchcore_proportions", "dino_patchcore_confounders")},
-    "clip_zs": "methods/clip_zs.py",
-}
+RAW = cfg.RESULTS_DIR / "raw"
+EXAMPLES = 3            # problems printed per set and kind
 
-_exc_file = Path("provenance_exceptions.json")
-EXCEPTIONS = ({e["set"]: e for e in json.load(open(_exc_file))["exceptions"]}
-              if _exc_file.exists() else {})
+N_DS = len(cfg.DATASETS)
+N_SEEDS = len(cfg.SEEDS)
+N_SUBSET_SEEDS = len(cfg.SUBSET_SEEDS)
 
-fails: list[str] = []
+# Banks per seed of the composition experiments, from the runners' own banks()
+# applied to placeholder reference lists (only their lengths matter). In
+# run_proportions a bank shared by several names is stored under each of them.
+_PLACEHOLDER = {d: list(range(10_000)) for d in cfg.DATASETS}
+CONTAMINATION_BANKS = len(run_contamination.banks(_PLACEHOLDER, 0))
+PROPORTION_BANKS = sum(len(names) for names, _ in
+                       run_proportions.banks(_PLACEHOLDER, 0).values())
+
+
+@dataclass
+class ResultSet:
+    name: str
+    cells: int
+    full_split: bool = False    # every cell scores its whole target test split
+
+
+REFERENCE_BASED = [m for m in METHODS if m not in BENCHMARK_REFERENCE_FREE]
+REFERENCE_FREE = [m for m in METHODS if m in BENCHMARK_REFERENCE_FREE]
+
+RESULT_SETS = [
+    *(ResultSet(m, N_DS * N_DS * N_SEEDS, full_split=True) for m in REFERENCE_BASED),
+    *(ResultSet(m, N_DS, full_split=True) for m in REFERENCE_FREE),
+    ResultSet("dino_patchcore_mixed", len(PAIRS) * N_DS * N_SUBSET_SEEDS, full_split=True),
+    ResultSet("dino_patchcore_mvtecsplit", len(GROUPS) ** 2 * N_SEEDS),
+    ResultSet("dino_patchcore_fewshot",
+              len(N_SHOTS) * N_DS * N_DS * N_SUBSET_SEEDS, full_split=True),
+    ResultSet("dino_patchcore_contamination", CONTAMINATION_BANKS * N_DS * N_SEEDS),
+    ResultSet("dino_patchcore_proportions", PROPORTION_BANKS * N_DS * N_SEEDS),
+    ResultSet("dino_patchcore_confounders",
+              len(ARMS) * N_DS * N_DS * len(cfg.CONFOUNDER_SEEDS)),
+    ResultSet("dino_patchcore_localisation",
+              N_DS * len(LOCALISATION_TARGETS) * N_SEEDS, full_split=True),
+    ResultSet("spade_layers", len(SPADE_LAYER_ARMS) * N_SEEDS, full_split=True),
+]
+
+
+def load_test_splits() -> tuple[dict, dict]:
+    """({dataset: (paths, labels)}, {path: label}) from the dataset loaders."""
+    splits, label_of = {}, {}
+    for name in cfg.DATASETS:
+        test = build_dataset(name).test()
+        paths = [str(p) for p in test.image_paths]
+        splits[name] = (paths, list(test.labels))
+        label_of.update(zip(paths, test.labels))
+    return splits, label_of
+
+
+def target_of(cell_rel) -> str | None:
+    for part in reversed(cell_rel.parts):
+        if "__" in part:
+            return part.split("__", 1)[1]
+    return None
+
+
+def check_cell(cell, rs: ResultSet, splits: dict, label_of: dict) -> list[tuple[str, str]]:
+    problems = []
+    try:
+        result = json.loads((cell / "result.json").read_text())
+    except (OSError, ValueError) as e:
+        return [("unreadable result.json", f"{type(e).__name__}")]
+    if "config" not in result:
+        problems.append(("result.json without config", ""))
+
+    npz = cell / "scores.npz"
+    if not npz.exists():
+        return problems + [("missing scores.npz", "")]
+    try:
+        with np.load(npz, allow_pickle=False) as d:
+            scores, labels, paths = d["scores"], d["labels"], [str(p) for p in d["paths"]]
+    except Exception as e:
+        return problems + [("unreadable scores.npz", f"{type(e).__name__}: {e}")]
+
+    if not len(scores) == len(labels) == len(paths) > 0:
+        return problems + [("scores/labels/paths lengths differ or are zero",
+                            f"{len(scores)}/{len(labels)}/{len(paths)}")]
+    if not np.isfinite(scores).all():
+        return problems + [("non-finite scores", "")]
+
+    unknown = [p for p in paths if p not in label_of]
+    wrong = [p for p, y in zip(paths, labels) if p in label_of and label_of[p] != y]
+    if unknown:
+        problems.append(("paths not in any loader test split", f"{len(unknown)}, e.g. {unknown[0]}"))
+    if wrong:
+        problems.append(("labels differ from the loader", f"{len(wrong)}, e.g. {wrong[0]}"))
+    if rs.full_split:
+        tgt = target_of(cell.relative_to(RAW / rs.name))
+        if tgt not in splits:
+            problems.append(("cannot determine target test split", ""))
+        elif (paths, labels.tolist()) != splits[tgt]:
+            problems.append(("paths/labels differ from the full test split", tgt))
+
+    if "image_auroc" not in result:
+        problems.append(("result.json without image_auroc", ""))
+    elif len(np.unique(labels)) < 2:
+        problems.append(("single-class labels", ""))
+    elif abs(result["image_auroc"] - roc_auc_score(labels, scores)) > 1e-12:
+        problems.append(("stored image_auroc differs from recomputed AUROC",
+                         f"{result['image_auroc']} vs {roc_auc_score(labels, scores)}"))
+    return problems
 
 
 def main() -> None:
-    print("1. INTEGRITY — scores.npz reproduces result.json")
-    n_ok = n_skip = 0
-    for npz in sorted(ROOT.rglob("scores.npz")):
-        rj = npz.parent / "result.json"
-        if not rj.exists():
-            fails.append(f"scores without result: {npz.parent}"); continue
-        try:
-            d = np.load(npz, allow_pickle=False)
-            saved = json.load(open(rj))["image_auroc"]
-            if len(np.unique(d["labels"])) < 2:
-                n_skip += 1; continue          # AUROC undefined for one class
-            if abs(saved - roc_auc_score(d["labels"], d["scores"])) > 1e-12:
-                fails.append(f"metric mismatch: {npz.parent}")
-            else:
-                n_ok += 1
-        except Exception as e:
-            fails.append(f"unreadable {npz}: {type(e).__name__}")
-    print(f"   {n_ok} verified, {n_skip} skipped (single-class)")
+    argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args()
+    splits, label_of = load_test_splits()
+    n_problems = 0
+    for rs in RESULT_SETS:
+        root = RAW / rs.name
+        cells = sorted(p.parent for p in root.rglob("result.json")) if root.exists() else []
+        orphans = sorted({p.parent for p in root.rglob("scores.npz")} - set(cells)) \
+            if root.exists() else []
+        by_kind: dict[str, list[str]] = defaultdict(list)
+        if len(cells) != rs.cells:
+            by_kind["cell count"].append(f"{len(cells)} complete cells, expected {rs.cells}")
+        for cell in orphans:
+            by_kind["scores.npz without result.json"].append(str(cell.relative_to(root)))
+        for cell in cells:
+            for kind, detail in check_cell(cell, rs, splits, label_of):
+                rel = str(cell.relative_to(root))
+                by_kind[kind].append(f"{rel} {detail}".rstrip())
 
-    print("2. COMPLETENESS — expected cell counts")
-    for name, want in EXPECTED.items():
-        got = len(list((ROOT / name).rglob("result.json"))) if (ROOT / name).exists() else 0
-        status = "ok" if got == want else "MISMATCH"
-        if got != want:
-            fails.append(f"{name}: {got} results, expected {want}")
-        print(f"   {name:32s} {got:4d}/{want:<4d} {status}")
+        status = "ok" if not by_kind else "FAIL"
+        print(f"{rs.name:30s} {len(cells):4d}/{rs.cells:<4d} {status}")
+        for kind, items in by_kind.items():
+            n_problems += len(items)
+            print(f"    {kind}: {len(items)}")
+            for item in items[:EXAMPLES]:
+                print(f"      {item}")
+            if len(items) > EXAMPLES:
+                print(f"      ... {len(items) - EXAMPLES} more")
 
-    print("3. SANITY — value ranges")
-    bad = 0
-    for rj in ROOT.rglob("result.json"):
-        d = json.load(open(rj))
-        # Not every experiment reports image_auroc: the localisation runs are
-        # pixel-level only. Validate whatever bounded metrics a file does carry,
-        # and require at least one of them.
-        bounded = {k: v for k, v in d.items()
-                   if ("auroc" in k or k.endswith("_ap") or k == "argmax_in_mask")
-                   and isinstance(v, (int, float))}
-        if not bounded:
-            fails.append(f"no bounded metric in {rj}"); bad += 1
-            continue
-        for k, v in bounded.items():
-            if v != v or not (0.0 <= v <= 1.0):
-                fails.append(f"implausible {k} in {rj}: {v}"); bad += 1
-    print(f"   {bad} implausible values")
-
-    print("4. PROVENANCE — results must postdate the code that made them")
-    for name, src in GOVERNS.items():
-        d = ROOT / name
-        if not d.exists() or not (CODE / src).exists():
-            continue
-        code_t = (CODE / src).stat().st_mtime
-        earliest = min((p.stat().st_mtime for p in d.rglob("result.json")), default=None)
-        if earliest is None:
-            continue
-        if earliest < code_t:
-            ex = EXCEPTIONS.get(name)
-            if ex and ex.get("identical") and ex.get("source") == src:
-                print(f"   {name:32s} predates {src}, but verified inert "
-                      f"({ex['verified_cell']} reproduces bit-for-bit)")
-            else:
-                fails.append(f"{name}: results predate {src} "
-                             f"(verify inertness or re-run)")
-                print(f"   {name:32s} STALE vs {src}")
-        else:
-            print(f"   {name:32s} ok")
-
-    print()
-    if fails:
-        print(f"{len(fails)} PROBLEM(S):")
-        for f in fails:
-            print(f"  - {f}")
-        sys.exit(1)
-    print("ALL CHECKS PASSED")
+    if n_problems:
+        sys.exit(f"{n_problems} problem(s) found")
+    print("all checks passed")
 
 
 if __name__ == "__main__":
