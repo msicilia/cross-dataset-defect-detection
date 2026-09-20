@@ -88,7 +88,7 @@ WINCLIP = {"batch_size": 8}
 # ── experiments ───────────────────────────────────────────────────────────────
 SEEDS = [0, 1, 2, 3, 4]
 SUBSET_SEEDS = [0, 1, 2]     # mixed-source and reference-set-size experiments
-CONFOUNDER_SEEDS = [0]       # confounder ablation
+CONFOUNDER_SEEDS = [0, 1, 2, 3, 4]   # confounder ablation
 # Label-stratified cap on target test sets in the contamination, proportion,
 # MVTec-split and confounder experiments; only SDNET2018 exceeds it.
 MAX_TEST = 2000

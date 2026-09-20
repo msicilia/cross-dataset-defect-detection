@@ -7,6 +7,10 @@ source != target cells, and the gap is their difference. Each quantity is
 computed per seed and then averaged over seeds; a standard deviation (ddof=1)
 is reported only when more than one seed is present.
 
+With more than one seed, each normalisation's gap is also compared with the
+baseline's by a paired t-test across seeds, Holm-corrected over the three
+comparisons, under "gap_vs_baseline".
+
 Input:  results/raw/dino_patchcore_confounders/<arm>/seed<s>/<src>__<tgt>/result.json
 Output: results/confounders.json
 
@@ -23,6 +27,7 @@ import statistics as st
 from pathlib import Path
 
 import config as cfg
+from analyze_significance import holm, paired_test
 
 ARMS = ["baseline", "gray", "equalised", "lowres"]
 
@@ -83,6 +88,20 @@ def main() -> None:
             "cells": {key: summarise(v) for key, v in cells.items()},
         }
         print(f"{arm:10s} {st.mean(ind):8.4f} {st.mean(cro):8.4f} {st.mean(gap):8.4f}")
+
+    # Each normalisation against the unnormalised baseline, paired across seeds,
+    # with Holm correction over the three comparisons. A normalisation that
+    # removed the factor responsible for the gap would shrink it significantly.
+    if len(cfg.CONFOUNDER_SEEDS) > 1:
+        base = out["arms"]["baseline"]["gap"]["per_seed"]
+        tests = {arm: paired_test(out["arms"][arm]["gap"]["per_seed"], base)
+                 for arm in ARMS if arm != "baseline"}
+        holm(tests)
+        out["gap_vs_baseline"] = tests
+        print(f"\n  paired t-tests: gap vs baseline (df={len(base) - 1}, Holm over {len(tests)})")
+        for arm, r in tests.items():
+            print(f"    {arm:10s} mean_diff={r['mean_diff']:+.4f} t={r['t']:+.2f} "
+                  f"p={r['p']:.4f} p_holm={r['p_holm']:.4f}")
 
     dest = args.results_dir / "confounders.json"
     write_json(dest, out)

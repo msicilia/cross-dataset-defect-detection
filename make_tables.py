@@ -898,10 +898,22 @@ def collect_numbers(J: Inputs) -> dict:
         for k in ("gap", "in_distribution", "cross_dataset"):
             N.add(f"confounders__{k}__{arm}", J.get(CONFOUNDERS, "arms", arm, k, "mean"),
                   f"DINO-PatchCore {k.replace('_', ' ')} under the {arm} arm")
+        N.add(f"confounders__gap_sd__{arm}", J.get(CONFOUNDERS, "arms", arm, "gap", "sd"),
+              f"seed-to-seed SD of the gap under the {arm} arm")
         if arm != "baseline":
             N.add(f"confounders__gap_change_vs_baseline__{arm}",
                   J.get(CONFOUNDERS, "arms", arm, "gap", "mean") - base_gap,
                   f"gap under {arm} minus baseline gap")
+            for stat in ("t", "p_holm"):
+                N.add(f"confounders__gap_vs_baseline__{stat}__{arm}",
+                      J.get(CONFOUNDERS, "gap_vs_baseline", arm, stat),
+                      f"paired {stat} for {arm} gap vs baseline, Holm over the three arms")
+    N.add("confounders__sdnet_vision__baseline",
+          J.get(CONFOUNDERS, "arms", "baseline", "cells", "sdnet__vision", "mean"),
+          "SDNET2018->VISION AUROC, unnormalised")
+    N.add("confounders__sdnet_vision__equalised",
+          J.get(CONFOUNDERS, "arms", "equalised", "cells", "sdnet__vision", "mean"),
+          "SDNET2018->VISION AUROC under equalisation")
     N.add("confounders__gap_range__normalised_arms",
           span(J.get(CONFOUNDERS, "arms", a, "gap", "mean") for a in arms if a != "baseline"),
           "[min, max] gap over the normalisation arms")
